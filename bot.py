@@ -346,6 +346,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "2. Search Music: Type /search [song name] to find tracks.\n"
         "3. Top Hits: Type /trending to see popular songs.\n"
         "4. Identify Music: Forward a voice note or audio clip to find out its name.\n\n"
+        "Read the English Guide: https://telegra.ph/Linko---User-Guide-10-17\n"
+        "မြန်မာလမ်းညွှန် ဖတ်ရန်: https://telegra.ph/Linko---User-Guide-MM-10-17\n\n"
         "By using Linko, you agree to our /terms."
     )
     await update.message.reply_text(welcome_text)
@@ -361,6 +363,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- MP3 Audio (128, 192, or 320 kbps)\n"
         "- Voice Note (OGG format)\n"
         "- MP4 Video (Watermark-free for short videos)\n\n"
+        "Read the English Guide: https://telegra.ph/Linko---User-Guide-10-17\n"
+        "မြန်မာလမ်းညွှန် ဖတ်ရန်: https://telegra.ph/Linko---User-Guide-MM-10-17\n\n"
         "Limits: Max 30 minutes length, max 50 MB file size."
     )
     await update.message.reply_text(help_text)
