@@ -50,7 +50,6 @@ QUALITY_PRESETS = {
     "high": {"label": "High (320 kbps - Best Quality)", "bitrate": "320"},
 }
 
-# Load Cookies from Render Environment Variables for Instagram/YouTube Login Bypass
 COOKIES_B64 = os.environ.get("COOKIES_B64", "").strip()
 COOKIES_FILE_PATH = "/tmp/linko_cookies.txt"
 if COOKIES_B64:
@@ -135,7 +134,7 @@ def fetch_lrclib_lyrics(query: str) -> str:
 
 
 def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
-    """Downloads audio utilizing yt-dlp mobile spoofing, Mutagen embedding, and Cobalt API Fallback."""
+    """Downloads audio utilizing yt-dlp mobile spoofing and Cobalt API Fallback."""
     job_dir = os.path.dirname(output_template)
     ydl_opts = {
         "format": "bestaudio/best",
@@ -149,7 +148,7 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
         "extractor_retries": 2,
         "fragment_retries": 2,
         "max_filesize": 50 * 1024 * 1024,
-        "writethumbnail": True,  # Grab cover art
+        "writethumbnail": True,
         "extractor_args": {
             "youtube": {
                 "player_client": ["ios", "android_vr", "tv", "mweb", "web"],
@@ -164,12 +163,10 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
                 "preferredcodec": "mp3",
                 "preferredquality": bitrate,
             },
+            
             {
-                "key": "EmbedThumbnail", # Embed cover art into MP3 via Mutagen
-            },
-            {
-                "key": "FFmpegMetadata", # Apply ID3 Tags
-                "add_metadata": True,
+                "key": "FFmpegThumbnailsConvertor",
+                "format": "jpg",
             }
         ],
     }
@@ -177,7 +174,6 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
     if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
         ydl_opts["cookiefile"] = COOKIES_FILE_PATH
 
-    # Engine 1: yt-dlp with anti-bot bypass and Mutagen metadata
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -201,7 +197,6 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
     except Exception as ytdlp_error:
         logger.warning(f"yt-dlp blocked for {url}: {ytdlp_error}. Engaging Cobalt Fallback API...")
         
-        # Engine 2: Cobalt API Fallback (Bypasses Datacenter IP Blocks)
         payload = {
             "url": url,
             "downloadMode": "audio",
@@ -233,7 +228,6 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
                                 for chunk in r.iter_content(chunk_size=65536):
                                     f.write(chunk)
                                     
-                        # Force exact bitrate conversion using FFmpeg
                         final_mp3 = os.path.join(job_dir, f"Linko_{uuid.uuid4().hex[:6]}.mp3")
                         subprocess.run(
                             ["ffmpeg", "-y", "-i", raw_file, "-vn", "-ar", "44100", "-ac", "2", "-b:a", f"{bitrate}k", final_mp3],
@@ -364,7 +358,7 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["links"] = {}
     context.user_data["links"][request_id] = message_text
     
-    # Playlist Detection
+    
     if "list=" in message_text or "/playlist" in message_text or "/album/" in message_text:
         keyboard = [
             [InlineKeyboardButton("🎵 Single Track", callback_data=f"askq|{request_id}")],
@@ -400,7 +394,7 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
             except: 
                 pass
 
-    await update_status(f"{status_prefix}⚙️ *Verifying & converting to MP3 ({bitrate} kbps)...*")
+    await update_status(f"{status_prefix}⚙️ *Downloading & Processing ({bitrate} kbps)...*")
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -424,8 +418,19 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
             
         await update_status(f"{status_prefix}📤 *Uploading MP3 to Telegram...*")
         
-        thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(('.jpg', '.webp', '.png'))), None)
         
+        thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.jpg')), None)
+        if thumb_path:
+            small_thumb = os.path.join(job_dir, "cover_320.jpg")
+            
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", thumb_path, "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-q:v", "5", small_thumb], 
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            if os.path.exists(small_thumb):
+                thumb_path = small_thumb
+        
+
         search_str = f"{metadata.get('title', '')} {metadata.get('uploader', '')}".strip()[:35]
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("📝 View Lyrics", callback_data=f"lyrics|{search_str}")]])
         
@@ -515,7 +520,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await execute_download(update.effective_chat.id, url, bitrate, context, query.message)
             
         else:
-            # Batch Playlist Runner
             await query.edit_message_text("⏳ *Extracting Playlist metadata...*", parse_mode="Markdown")
             def get_playlist():
                 with yt_dlp.YoutubeDL({"extract_flat": True, "quiet": True}) as ydl:
