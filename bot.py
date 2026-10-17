@@ -41,6 +41,7 @@ MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 4))
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 USER_COOLDOWN_SECONDS = int(os.environ.get("USER_COOLDOWN_SECONDS", 15))
 user_last_request: dict[int, float] = {}
+user_active_tasks: dict[int, int] = {}
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 MAX_PLAYLIST_ITEMS = 10
 
@@ -59,7 +60,6 @@ if COOKIES_B64:
         logger.info("Loaded custom cookies.txt from COOKIES_B64 environment variable.")
     except Exception as e:
         logger.warning(f"Failed to decode COOKIES_B64: {e}")
-
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
@@ -80,7 +80,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-
 def start_health_server() -> None:
     try:
         server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
@@ -89,12 +88,16 @@ def start_health_server() -> None:
     except Exception as e:
         logger.error(f"Failed to start health-check server: {e}")
 
-
 def is_safe_public_url(text: str) -> tuple[bool, str]:
     try:
         result = urlparse(text.strip())
         if result.scheme not in ("http", "https") or not result.netloc:
             return (False, "Please provide a valid URL starting with `http://` or `https://`.")
+        
+        blocked_exts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf', '.docx', '.zip']
+        if any(result.path.lower().endswith(ext) for ext in blocked_exts):
+            return (False, "This link appears to be an image or document. Please send a valid video or audio link.")
+
         hostname = result.hostname
         if not hostname:
             return (False, "Could not determine the website hostname.")
@@ -118,7 +121,6 @@ def is_safe_public_url(text: str) -> tuple[bool, str]:
     except Exception:
         return (False, "Invalid URL format.")
 
-
 def fetch_lrclib_lyrics(query: str) -> str:
     headers = {"User-Agent": "LinkoBot (https://t.me/LinkoBot)"}
     try:
@@ -131,17 +133,17 @@ def fetch_lrclib_lyrics(query: str) -> str:
         logger.warning(f"LRCLIB failed: {e}")
     return ""
 
-
 def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
     job_dir = os.path.dirname(output_template)
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": output_template,
+        "restrictfilenames": True,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "geo_bypass": True,
-        "socket_timeout": 30,
+        "socket_timeout": 20,
         "retries": 2,
         "extractor_retries": 2,
         "fragment_retries": 2,
@@ -213,19 +215,19 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
         
         for api in endpoints:
             try:
-                resp = requests.post(api, json=payload, headers=headers, timeout=20)
+                resp = requests.post(api, json=payload, headers=headers, timeout=15)
                 if resp.status_code == 200:
                     dl_url = resp.json().get("url")
                     title = resp.json().get("filename", "Linko_Audio").replace("_", " ")
                     if dl_url:
                         raw_file = os.path.join(job_dir, "raw_audio_temp")
-                        with requests.get(dl_url, stream=True, timeout=30) as r:
+                        with requests.get(dl_url, stream=True, timeout=25) as r:
                             r.raise_for_status()
                             with open(raw_file, "wb") as f:
                                 for chunk in r.iter_content(chunk_size=65536):
                                     f.write(chunk)
                                     
-                        final_mp3 = os.path.join(job_dir, f"Linko_{uuid.uuid4().hex[:6]}.mp3")
+                        final_mp3 = os.path.join(job_dir, f"audio_track.mp3")
                         subprocess.run(
                             ["ffmpeg", "-y", "-i", raw_file, "-vn", "-ar", "44100", "-ac", "2", "-b:a", f"{bitrate}k", final_mp3],
                             stdout=subprocess.DEVNULL,
@@ -243,23 +245,21 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
                 
         raise ytdlp_error
 
-
 def explain_download_error(error: Exception) -> str:
     message = str(error).lower()
     if any((term in message for term in ("sign in to confirm", "not a bot"))):
-        return "YouTube/Instagram blocked anonymous access from this server's IP. Add a `COOKIES_B64` environment variable in Render to authenticate requests."
+        return "YouTube/Instagram blocked anonymous access from this server's IP. Authenticated cookies are required."
     if any((term in message for term in ("sign in", "login required", "private", "authentication"))):
-        return "This media appears to require login, is private, or is age-restricted. Linko only processes publicly accessible content."
+        return "This media requires login, is private, or is age-restricted. Linko only processes public content."
     if "ffmpeg" in message or "ffprobe" in message or "postprocessing" in message:
-        return "The MP3 conversion tool is unavailable. Check that the latest Docker image finished building with FFmpeg installed."
+        return "The audio conversion engine is temporarily unavailable. Please try again later."
     if "unsupported url" in message or "no suitable extractor" in message:
-        return "This link format is not supported. Send the full public post or video URL."
+        return "This link format is not supported. Ensure it is a valid video/audio post, not an image or website."
     if any((term in message for term in ("file is larger", "filesize", "file size"))):
         return "The source is larger than Linko's 50 MB processing limit."
     if any((term in message for term in ("no video formats", "requested format", "no formats"))):
-        return "The platform did not provide a downloadable audio format for this public link."
-    return "The platform did not return downloadable media. Check that the link is public, then try again later."
-
+        return "No downloadable audio format found. The link might be an image, text post, or unsupported media."
+    return "The platform did not return downloadable media. Check that the link is public and contains an audio track."
 
 async def post_init(application) -> None:
     commands = [
@@ -273,32 +273,26 @@ async def post_init(application) -> None:
     await application.bot.set_my_commands(commands)
     logger.info("Bot command menu registered successfully.")
 
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_first_name = update.effective_user.first_name or "there"
     welcome_text = f"👋 Welcome to *Linko*, {user_first_name}!\n\nI am a non-profit utility bot that converts publicly accessible media links into downloadable *MP3 audio files*.\n\n🚀 *How to use:*\n1. Paste a public link in this chat.\n2. Or type `/search [song name]` to find music instantly!\n3. Receive your converted MP3 file directly on your device!\n\n⚖️ _By using Linko, you agree to our `/terms` regarding copyright and platform policies._"
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = "📖 *Linko Bot Help Guide*\n\nSimply paste a valid, publicly accessible link starting with `http://` or `https://`.\n\n*Available Commands:*\n• `/start` - Restart the bot and view welcome message\n• `/search` - Search YouTube and download audio\n• `/help` - Show this usage guide\n• `/quality` - Compare audio quality bitrates and file sizes\n• `/terms` - View copyright, fair-use, and platform rules\n• `/about` - Learn about Linko\n\n*Limits:* Maximum duration is *30 minutes* and maximum file size is *50 MB*."
     await update.message.reply_text(help_text, parse_mode="Markdown")
-
 
 async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     quality_text = "🎧 *Audio Quality & Format Options*\n\nAll links are converted into universal *.mp3* format, tailored by bitrate:\n\n1️⃣ *Standard (128 kbps)*\n   • *Best for:* Podcasts, speeches, fast downloads, saving data.\n   • *Approx. Size:* ~1 MB per minute.\n\n2️⃣ *Medium (192 kbps)*\n   • *Best for:* Everyday music listening with balanced size and clarity.\n   • *Approx. Size:* ~1.4 MB per minute.\n\n3️⃣ *High (320 kbps)*\n   • *Best for:* High-fidelity music and maximum MP3 audio depth.\n   • *Approx. Size:* ~2.4 MB per minute."
     await update.message.reply_text(quality_text, parse_mode="Markdown")
 
-
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     about_text = "🤖 *About Linko*\n\nLinko is a free, non-profit educational utility bot built to make saving authorized, public-domain, and Creative Commons audio in MP3 format simple.\n\nBuilt with Python, `python-telegram-bot`, `yt-dlp`, and `FFmpeg`."
     await update.message.reply_text(about_text, parse_mode="Markdown")
 
-
 async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     terms_text = "⚖️ *Platform Policy, Copyright & Security Terms*\n\n1. *Authorized & Fair Use Only:* Linko is strictly intended for downloading your own content, Creative Commons/royalty-free audio, public domain works, or material for which you have explicit permission from the copyright holder.\n\n2. *No DRM or Paywall Circumvention:* Linko respects platform security measures. It does *not* bypass Digital Rights Management (DRM), private accounts, age-restricted gates, or paid subscriptions.\n\n3. *Platform Terms of Service:* Social platforms prohibit unauthorized redistribution of copyrighted content.\n\n4. *Zero Retention Privacy:* Downloaded files are permanently deleted from the server immediately after delivery."
     await update.message.reply_text(terms_text, parse_mode="Markdown")
-
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(context.args)
@@ -334,14 +328,18 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception:
         await msg.edit_text("❌ Search failed.")
 
-
 async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    
+    if user_active_tasks.get(user_id, 0) > 0:
+        await update.message.reply_text("🚨 *Anti-Spam Active:*\nYou already have a file processing. Please wait for it to complete before sending another link.", parse_mode="Markdown")
+        return
+
     now = time.time()
     last_req = user_last_request.get(user_id, 0)
     if now - last_req < USER_COOLDOWN_SECONDS:
         remaining = int(USER_COOLDOWN_SECONDS - (now - last_req))
-        await update.message.reply_text(f"⏳ Please wait *{remaining} seconds* before submitting another link.", parse_mode="Markdown")
+        await update.message.reply_text(f"⏳ *Rate Limited:*\nPlease wait *{remaining} seconds* before submitting another link to prevent server abuse.", parse_mode="Markdown")
         return
     
     message_text = update.message.text.strip()
@@ -354,7 +352,6 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if "links" not in context.user_data:
         context.user_data["links"] = {}
     context.user_data["links"][request_id] = message_text
-    
     
     if "list=" in message_text or "/playlist" in message_text or "/album/" in message_text:
         keyboard = [
@@ -381,7 +378,6 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown",
         )
 
-
 async def execute_download(chat_id, url, bitrate, context, status_msg=None, status_prefix=""):
     async def update_status(text):
         if status_msg:
@@ -390,11 +386,12 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
             except: 
                 pass
 
-    await update_status(f"{status_prefix}⚙️ *Downloading & Processing ({bitrate} kbps)...*")
+    await update_status(f"{status_prefix}⚙️ *Downloading & Processing ({bitrate} kbps)...*\n_⏳ Please wait, this may take a minute or more depending on the file size. Do not send multiple links._")
+    
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-    output_template = os.path.join(job_dir, "%(title).80s.%(ext)s")
+    output_template = os.path.join(job_dir, "audio_track.%(ext)s")
     
     try:
         async with download_semaphore:
@@ -414,7 +411,6 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
             
         await update_status(f"{status_prefix}📤 *Uploading MP3 to Telegram...*")
         
-        
         thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.jpg')), None)
         if thumb_path:
             small_thumb = os.path.join(job_dir, "cover_320.jpg")
@@ -425,7 +421,6 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
             if os.path.exists(small_thumb):
                 thumb_path = small_thumb
         
-
         raw_title = metadata.get('title', '')
         uploader = metadata.get('uploader', '').replace(' - Topic', '')
         clean_title = re.sub(r'(?i)(\(official.*?\)|\[official.*?\]|\(music video.*?\)|\(lyric.*?\)|\[lyric.*?\]|\(audio.*?\)|\[audio.*?\]|\(live.*?\))', '', raw_title).strip()
@@ -468,11 +463,11 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
 
-
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = update.effective_user.id
     
     if data.startswith("lyrics|"):
         search_term = data.split("|", 1)[1]
@@ -504,6 +499,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return await query.edit_message_text("☑️ Choose MP3 quality:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     if data.startswith("dl"):
+        if user_active_tasks.get(user_id, 0) > 0:
+            await query.edit_message_text("🚨 *Anti-Spam Active:*\nYou already have a file processing. Please wait for it to complete.", parse_mode="Markdown")
+            return
+
         parts = data.split("|")
         prefix, req_id, quality_key = parts[0], parts[1], parts[2]
         
@@ -512,55 +511,60 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text("⏳ This session expired. Please paste your link again.")
             return
             
-        user_last_request[update.effective_user.id] = time.time()
+        user_last_request[user_id] = time.time()
         preset = QUALITY_PRESETS.get(quality_key, QUALITY_PRESETS["medium"])
         bitrate = preset["bitrate"]
         
-        if prefix == "dl":
-            await query.edit_message_text(
-                f"⏳ *Queued for processing...*\nQuality: `{preset['label']}`\nPlease wait while Linko prepares your MP3.",
-                parse_mode="Markdown",
-            )
-            await execute_download(update.effective_chat.id, url, bitrate, context, query.message)
-            
-        else:
-            await query.edit_message_text("⏳ *Extracting Playlist metadata...*", parse_mode="Markdown")
-            def get_playlist():
-                with yt_dlp.YoutubeDL({"extract_flat": True, "quiet": True}) as ydl:
-                    return ydl.extract_info(url, download=False)
-            try:
-                info = await asyncio.to_thread(get_playlist)
-                entries = info.get("entries", []) if info else []
-            except: 
-                entries = []
-            
-            if not entries: 
-                entries = [{"url": url}]
+        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
+        
+        try:
+            if prefix == "dl":
+                await query.edit_message_text(
+                    f"⏳ *Queued for processing...*\nQuality: `{preset['label']}`",
+                    parse_mode="Markdown",
+                )
+                await execute_download(update.effective_chat.id, url, bitrate, context, query.message)
                 
-            entries = list(entries)[:MAX_PLAYLIST_ITEMS]
-            
-            await query.edit_message_text(
-                f"💽 *Playlist queued:* {len(entries)} tracks. Processing sequentially to protect server memory...", 
-                parse_mode="Markdown"
-            )
-            
-            for i, entry in enumerate(entries, 1):
-                if not entry.get("url"): 
-                    continue
-                status_msg = await context.bot.send_message(
-                    update.effective_chat.id, 
-                    f"*(Track {i}/{len(entries)})* ⏳ Waiting...", 
+            else:
+                await query.edit_message_text("⏳ *Extracting Playlist metadata...*", parse_mode="Markdown")
+                def get_playlist():
+                    with yt_dlp.YoutubeDL({"extract_flat": True, "quiet": True}) as ydl:
+                        return ydl.extract_info(url, download=False)
+                try:
+                    info = await asyncio.to_thread(get_playlist)
+                    entries = info.get("entries", []) if info else []
+                except: 
+                    entries = []
+                
+                if not entries: 
+                    entries = [{"url": url}]
+                    
+                entries = list(entries)[:MAX_PLAYLIST_ITEMS]
+                
+                await query.edit_message_text(
+                    f"💽 *Playlist queued:* {len(entries)} tracks. Processing sequentially to protect server memory...", 
                     parse_mode="Markdown"
                 )
-                await execute_download(
-                    update.effective_chat.id, 
-                    entry["url"], 
-                    bitrate, 
-                    context, 
-                    status_msg, 
-                    f"*(Track {i}/{len(entries)})* "
-                )
-
+                
+                for i, entry in enumerate(entries, 1):
+                    if not entry.get("url"): 
+                        continue
+                    status_msg = await context.bot.send_message(
+                        update.effective_chat.id, 
+                        f"*(Track {i}/{len(entries)})* ⏳ Waiting...", 
+                        parse_mode="Markdown"
+                    )
+                    await execute_download(
+                        update.effective_chat.id, 
+                        entry["url"], 
+                        bitrate, 
+                        context, 
+                        status_msg, 
+                        f"*(Track {i}/{len(entries)})* "
+                    )
+        finally:
+            if user_active_tasks[user_id] > 0:
+                user_active_tasks[user_id] -= 1
 
 def main() -> None:
     if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
@@ -586,7 +590,6 @@ def main() -> None:
     
     logger.info("Linko Bot is now running...")
     application.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
