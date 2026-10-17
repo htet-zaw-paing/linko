@@ -424,19 +424,27 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
             
         await update_status(f"{status_prefix}📤 *Uploading MP3 to Telegram...*")
         
+        thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(('.jpg', '.webp', '.png'))), None)
+        
         search_str = f"{metadata.get('title', '')} {metadata.get('uploader', '')}".strip()[:35]
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("📝 View Lyrics", callback_data=f"lyrics|{search_str}")]])
         
         with open(mp3_path, "rb") as audio_file:
-            await context.bot.send_audio(
-                chat_id=chat_id,
-                audio=audio_file,
-                title=metadata.get("title", "Audio").replace("_", " "),
-                performer=metadata.get("uploader", "Linko").replace("_", " "),
-                caption=f"*Downloaded via Linko*\n*Quality:* {bitrate} kbps MP3\n*Size:* {file_size_mb:.2f} MB",
-                parse_mode="Markdown",
-                reply_markup=btn
-            )
+            thumb_file = open(thumb_path, "rb") if thumb_path else None
+            try:
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=audio_file,
+                    title=metadata.get("title", "Audio").replace("_", " "),
+                    performer=metadata.get("uploader", "Linko").replace("_", " "),
+                    thumbnail=thumb_file,
+                    caption=f"*Downloaded via Linko*\n*Quality:* {bitrate} kbps MP3\n*Size:* {file_size_mb:.2f} MB",
+                    parse_mode="Markdown",
+                    reply_markup=btn
+                )
+            finally:
+                if thumb_file:
+                    thumb_file.close()
             
         if status_msg: 
             await context.bot.delete_message(chat_id, status_msg.message_id)
