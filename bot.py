@@ -120,7 +120,6 @@ def is_safe_public_url(text: str) -> tuple[bool, str]:
 
 
 def fetch_lrclib_lyrics(query: str) -> str:
-    """Fetches plain lyrics from the free LRCLIB API."""
     headers = {"User-Agent": "LinkoBot (https://t.me/LinkoBot)"}
     try:
         r = requests.get(f"https://lrclib.net/api/search?q={urllib.parse.quote(query)}", headers=headers, timeout=10)
@@ -134,7 +133,6 @@ def fetch_lrclib_lyrics(query: str) -> str:
 
 
 def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
-    """Downloads audio utilizing yt-dlp mobile spoofing and Cobalt API Fallback."""
     job_dir = os.path.dirname(output_template)
     ydl_opts = {
         "format": "bestaudio/best",
@@ -163,7 +161,6 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
                 "preferredcodec": "mp3",
                 "preferredquality": bitrate,
             },
-            
             {
                 "key": "FFmpegThumbnailsConvertor",
                 "format": "jpg",
@@ -386,7 +383,6 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def execute_download(chat_id, url, bitrate, context, status_msg=None, status_prefix=""):
-    """Core download runner for both Single and Batch jobs."""
     async def update_status(text):
         if status_msg:
             try: 
@@ -422,7 +418,6 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
         thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.jpg')), None)
         if thumb_path:
             small_thumb = os.path.join(job_dir, "cover_320.jpg")
-            
             subprocess.run(
                 ["ffmpeg", "-y", "-i", thumb_path, "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-q:v", "5", small_thumb], 
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -431,7 +426,16 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
                 thumb_path = small_thumb
         
 
-        search_str = f"{metadata.get('title', '')} {metadata.get('uploader', '')}".strip()[:35]
+        raw_title = metadata.get('title', '')
+        uploader = metadata.get('uploader', '').replace(' - Topic', '')
+        clean_title = re.sub(r'(?i)(\(official.*?\)|\[official.*?\]|\(music video.*?\)|\(lyric.*?\)|\[lyric.*?\]|\(audio.*?\)|\[audio.*?\]|\(live.*?\))', '', raw_title).strip()
+        
+        if uploader.lower() not in clean_title.lower():
+            search_str = f"{clean_title} {uploader}"
+        else:
+            search_str = clean_title
+            
+        search_str = search_str[:45].strip()
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("📝 View Lyrics", callback_data=f"lyrics|{search_str}")]])
         
         with open(mp3_path, "rb") as audio_file:
