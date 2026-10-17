@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import re
 import uuid
 import shutil
 import time
@@ -31,28 +32,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Retrieve the Telegram Bot Token from environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 
-# Port for the 24/7 keep-alive health-check server (used by Render/Koyeb)
 PORT = int(os.environ.get("PORT", 8080))
 
-# Directory to temporarily store downloaded audio files before sending
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Limit concurrent heavy downloads to prevent server RAM/CPU exhaustion
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 4))
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# 1. Per-user cooldown (in seconds) to prevent automated bot abuse and IP bans
 USER_COOLDOWN_SECONDS = int(os.environ.get("USER_COOLDOWN_SECONDS", 15))
 user_last_request: dict[int, float] = {}
 
-# 2. Maximum allowed audio duration (in seconds) - default 30 mins (1800s)
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 
-# Audio quality presets mapped to FFmpeg MP3 bitrates
 QUALITY_PRESETS = {
     "standard": {
         "label": "Standard (128 kbps - Smaller Size)",
@@ -90,7 +84,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        # Suppress HTTP access logs to keep console clean
         pass
 
 
@@ -119,11 +112,9 @@ def is_safe_public_url(text: str) -> tuple[bool, str]:
         if not hostname:
             return False, "Could not determine the website hostname."
 
-        # Block localhost or local network domains explicitly
         if hostname.lower() in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
             return False, "Localhost and internal network links are blocked for security."
 
-        # Resolve hostname to IP and verify it is globally routable (not private/internal)
         addr_info = socket.getaddrinfo(hostname, None)
         for item in addr_info:
             ip_str = item[4][0]
@@ -156,8 +147,11 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "geo_bypass": False,  # Respect regional restrictions
-        "socket_timeout": 20,
+        "geo_bypass": False,
+        "socket_timeout": 30,
+        "retries": 2,
+        "extractor_retries": 2,
+        "fragment_retries": 2,
         "max_filesize": 50 * 1024 * 1024,
         "http_headers": {
             "User-Agent": (
@@ -176,7 +170,6 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        # Step 1: Extract metadata without downloading to verify policy compliance
         info = ydl.extract_info(url, download=False)
         if not info:
             raise ValueError("Unable to retrieve media information.")
@@ -191,14 +184,42 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
                 f"Media duration ({duration // 60} mins) exceeds the {max_mins}-minute policy limit."
             )
 
-        # Step 2: Proceed with download and MP3 conversion
-        info = ydl.extract_info(url, download=True)
+        info = ydl.process_ie_result(info, download=True)
         return {
             "title": info.get("title", "Audio Track"),
             "uploader": info.get("uploader", "Linko Bot"),
             "duration": duration,
             "webpage_url": info.get("webpage_url", url),
         }
+
+
+def explain_download_error(error: Exception) -> str:
+    """Return a short, actionable hint without exposing raw extractor details."""
+    message = str(error).lower()
+
+    if any(term in message for term in ("sign in", "login required", "private", "authentication")):
+        return (
+            "This media appears to require login, is private, or is age-restricted. "
+            "Linko only processes publicly accessible content."
+        )
+    if "ffmpeg" in message or "ffprobe" in message or "postprocessing" in message:
+        return (
+            "The MP3 conversion tool is unavailable. Check that the latest Docker "
+            "image finished building with FFmpeg installed."
+        )
+    if "unsupported url" in message or "no suitable extractor" in message:
+        return "This link format is not supported. Send the full public post or video URL."
+    if any(term in message for term in ("file is larger", "filesize", "file size")):
+        return "The source is larger than Linko's 50 MB processing limit."
+    if any(term in message for term in ("no video formats", "requested format", "no formats")):
+        return (
+            "The platform did not provide a downloadable audio format for this public link. "
+            "Try another public post or video."
+        )
+    return (
+        "The platform did not return downloadable media. Check that the link is public, "
+        "then try again later; platform access restrictions cannot be bypassed by Linko."
+    )
 
 
 async def post_init(application) -> None:
@@ -254,13 +275,13 @@ async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     quality_text = (
         "🎧 *Audio Quality & Format Options*\n\n"
         "All links are converted into universal *.mp3* format, tailored by bitrate:\n\n"
-        "1️⃣ *Standard (128 kbps)*\n"
+        "⚪ *Standard (128 kbps)*\n"
         "   • *Best for:* Podcasts, speeches, fast downloads, saving data.\n"
         "   • *Approx. Size:* ~1 MB per minute.\n\n"
-        "2️⃣ *Medium (192 kbps)*\n"
+        "🔵 *Medium (192 kbps)*\n"
         "   • *Best for:* Everyday music listening with balanced size and clarity.\n"
         "   • *Approx. Size:* ~1.4 MB per minute.\n\n"
-        "3️⃣ *High (320 kbps)*\n"
+        "💎 *High (320 kbps)*\n"
         "   • *Best for:* High-fidelity music and maximum MP3 audio depth.\n"
         "   • *Approx. Size:* ~2.4 MB per minute."
     )
@@ -306,7 +327,6 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     now = time.time()
 
-    # Check per-user rate limit to protect server and prevent platform IP blocks
     last_req = user_last_request.get(user_id, 0)
     if now - last_req < USER_COOLDOWN_SECONDS:
         remaining = int(USER_COOLDOWN_SECONDS - (now - last_req))
@@ -323,7 +343,6 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ {error_reason}", parse_mode="Markdown")
         return
 
-    # Store the URL in user_data with a short unique ID so callback data stays under Telegram's 64-byte limit
     request_id = str(uuid.uuid4())[:8]
     if "links" not in context.user_data:
         context.user_data["links"] = {}
@@ -393,7 +412,6 @@ async def handle_quality_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    # Record user cooldown timestamp upon starting a download
     user_last_request[update.effective_user.id] = time.time()
 
     preset = QUALITY_PRESETS.get(quality_key, QUALITY_PRESETS["medium"])
@@ -404,7 +422,6 @@ async def handle_quality_callback(update: Update, context: ContextTypes.DEFAULT_
         parse_mode="Markdown",
     )
 
-    # Create a dedicated temporary folder for this specific request to avoid filename collisions
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -416,12 +433,10 @@ async def handle_quality_callback(update: Update, context: ContextTypes.DEFAULT_
                 f"⚙️ *Verifying & converting to MP3 ({bitrate} kbps)...*",
                 parse_mode="Markdown",
             )
-            # Offload blocking yt-dlp + FFmpeg work to a background thread
             metadata = await asyncio.to_thread(
                 BlockingDownloadAudio, url, bitrate, output_template
             )
 
-        # Find the generated .mp3 file inside the job directory
         mp3_files = [
             os.path.join(job_dir, f)
             for f in os.listdir(job_dir)
@@ -463,20 +478,24 @@ async def handle_quality_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.delete_message()
 
     except ValueError as ve:
-        # Friendly policy / duration / live-stream error messages
         await query.edit_message_text(f"⚠️ *Policy Notice:* {ve}", parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Error processing URL {url}: {e}")
+        host = urlparse(url).hostname or "unknown host"
+        safe_detail = re.sub(r"https?://[^\s]+", "[URL]", str(e))[:500]
+        logger.error(
+            "Media processing failed for host=%s (%s): %s",
+            host,
+            type(e).__name__,
+            safe_detail,
+        )
         await query.edit_message_text(
             "❌ *Unable to process this link.*\n\n"
-            "Possible reasons:\n"
-            "• The post is private, age-restricted, or requires login.\n"
-            "• The platform blocked automated extraction (anti-bot protection).\n"
-            "• The content is DRM-protected or exceeds the 50 MB limit.",
+            f"{explain_download_error(e)}\n\n"
+            "Make sure you have permission to download the content. Linko does not "
+            "bypass private access, DRM, or platform restrictions.",
             parse_mode="Markdown",
         )
     finally:
-        # Always clean up temporary files immediately so free hosting disk doesn't fill up
         shutil.rmtree(job_dir, ignore_errors=True)
         context.user_data.get("links", {}).pop(request_id, None)
 
@@ -487,11 +506,9 @@ def main() -> None:
         logger.error("Please set your BOT_TOKEN environment variable before running.")
         return
 
-    # Start the 24/7 HTTP keep-alive server in a background daemon thread
     health_thread = Thread(target=start_health_server, daemon=True)
     health_thread.start()
 
-    # Build the async Telegram application with concurrent updates enabled
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -500,17 +517,14 @@ def main() -> None:
         .build()
     )
 
-    # Register command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("quality", quality_command))
     application.add_handler(CommandHandler("terms", terms_command))
     application.add_handler(CommandHandler("about", about_command))
 
-    # Register callback query handler for quality selection buttons
     application.add_handler(CallbackQueryHandler(handle_quality_callback, pattern=r"^dl\|"))
 
-    # Register message handler for links
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link_message)
     )
