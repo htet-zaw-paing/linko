@@ -70,24 +70,28 @@ QUALITY_PRESETS = {
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """
-    Lightweight HTTP handler that responds to cloud platform health probes
-    and UptimeRobot pings so the free instance stays online 24/7.
-    """
+    """Lightweight HTTP handler to satisfy Render/Koyeb 24/7 health checks."""
+
+    def do_HEAD(self):
+        """Handle UptimeRobot's default HEAD requests."""
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
 
     def do_GET(self):
+        """Handle standard browser/Render GET requests."""
         if self.path in ("/", "/health"):
             self.send_response(200)
             self.send_header("Content-type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(b"Linko Bot is alive and running 24/7!")
+            self.wfile.write(b"OK - Linko Bot is alive and running 24/7.")
         else:
             self.send_response(404)
             self.end_headers()
 
     def log_message(self, format, *args):
-        # Silence standard HTTP request logs to keep console clean
-        return
+        # Suppress HTTP access logs to keep console clean
+        pass
 
 
 def start_health_server() -> None:
