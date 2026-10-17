@@ -251,14 +251,14 @@ def explain_download_error(error: Exception) -> str:
         return "YouTube/Instagram blocked anonymous access from this server's IP. Authenticated cookies are required."
     if any((term in message for term in ("sign in", "login required", "private", "authentication"))):
         return "This media requires login, is private, or is age-restricted. Linko only processes public content."
-    if "ffmpeg" in message or "ffprobe" in message or "postprocessing" in message:
-        return "The audio conversion engine is temporarily unavailable. Please try again later."
     if "unsupported url" in message or "no suitable extractor" in message:
         return "This link format is not supported. Ensure it is a valid video/audio post, not an image or website."
+    if any((term in message for term in ("no video formats", "requested format", "no formats", "no video", "not a video"))):
+        return "No downloadable audio format found. The link might be an image post, text post, or unsupported media."
     if any((term in message for term in ("file is larger", "filesize", "file size"))):
         return "The source is larger than Linko's 50 MB processing limit."
-    if any((term in message for term in ("no video formats", "requested format", "no formats"))):
-        return "No downloadable audio format found. The link might be an image, text post, or unsupported media."
+    if "ffmpeg" in message or "ffprobe" in message or "postprocessing" in message:
+        return "The media does not contain a valid audio track, or the conversion engine could not process the format."
     return "The platform did not return downloadable media. Check that the link is public and contains an audio track."
 
 async def post_init(application) -> None:
@@ -328,11 +328,17 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception:
         await msg.edit_text("❌ Search failed.")
 
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📷 *Privacy Notice:*\n\nLinko only operates via text commands and links. For your privacy, please do not send personal photos, videos, or documents here.\n\nTo download audio, send a valid public link or use `/search`.",
+        parse_mode="Markdown"
+    )
+
 async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     
     if user_active_tasks.get(user_id, 0) > 0:
-        await update.message.reply_text("🚨 *Anti-Spam Active:*\nYou already have a file processing. Please wait for it to complete before sending another link.", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ *Anti-Spam Active:*\nYou already have a file processing. Please wait for it to complete before sending another link.", parse_mode="Markdown")
         return
 
     now = time.time()
@@ -343,6 +349,14 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     message_text = update.message.text.strip()
+    
+    if not re.search(r"https?://", message_text.lower()):
+        if len(message_text) < 50 and any(w in message_text.lower() for w in ["hi", "hello", "hey", "sup", "how are you"]):
+            await update.message.reply_text("👋 Hello! I am Linko Bot.\n\nSend me a valid media link or type `/search [song name]` to start downloading audio.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ That doesn't look like a valid link.\n\nPlease send a public link starting with `http://` or `https://`, or type `/search [song name]`.", parse_mode="Markdown")
+        return
+
     is_safe, error_reason = is_safe_public_url(message_text)
     if not is_safe:
         await update.message.reply_text(f"❌ {error_reason}", parse_mode="Markdown")
@@ -409,7 +423,7 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
             await update_status(f"{status_prefix}⚠️ Exceeds Telegram's 50 MB limit.")
             return
             
-        await update_status(f"{status_prefix}📤 *Uploading MP3 to Telegram...*")
+        await update_status(f"{status_prefix}*Uploading MP3 to Telegram...*")
         
         thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.jpg')), None)
         if thumb_path:
@@ -430,7 +444,11 @@ async def execute_download(chat_id, url, bitrate, context, status_msg=None, stat
         else:
             search_str = clean_title
             
-        search_str = search_str[:45].strip()
+        search_str = search_str.strip()
+        search_bytes = search_str.encode('utf-8')
+        if len(search_bytes) > 50:
+            search_str = search_bytes[:50].decode('utf-8', errors='ignore')
+            
         btn = InlineKeyboardMarkup([[InlineKeyboardButton("📝 View Lyrics", callback_data=f"lyrics|{search_str}")]])
         
         with open(mp3_path, "rb") as audio_file:
@@ -491,16 +509,16 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         dl_prefix = "dlpl" if "pl" in prefix else "dl"
         
         keyboard = [
-            [InlineKeyboardButton("⚪ Standard (128 kbps)", callback_data=f"{dl_prefix}|{req_id}|standard")],
-            [InlineKeyboardButton("🔵 Medium (192 kbps)", callback_data=f"{dl_prefix}|{req_id}|medium")],
-            [InlineKeyboardButton("💎 High (320 kbps)", callback_data=f"{dl_prefix}|{req_id}|high")],
+            [InlineKeyboardButton("Standard (128 kbps)", callback_data=f"{dl_prefix}|{req_id}|standard")],
+            [InlineKeyboardButton("Medium (192 kbps)", callback_data=f"{dl_prefix}|{req_id}|medium")],
+            [InlineKeyboardButton("High (320 kbps)", callback_data=f"{dl_prefix}|{req_id}|high")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel|000")]
         ]
         return await query.edit_message_text("☑️ Choose MP3 quality:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     if data.startswith("dl"):
         if user_active_tasks.get(user_id, 0) > 0:
-            await query.edit_message_text("🚨 *Anti-Spam Active:*\nYou already have a file processing. Please wait for it to complete.", parse_mode="Markdown")
+            await query.edit_message_text("⚠️ *Anti-Spam Active:*\nYou already have a file processing. Please wait for it to complete.", parse_mode="Markdown")
             return
 
         parts = data.split("|")
@@ -586,6 +604,7 @@ def main() -> None:
     application.add_handler(CommandHandler("terms", terms_command))
     application.add_handler(CommandHandler("about", about_command))
     application.add_handler(CallbackQueryHandler(handle_callbacks))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.VOICE, handle_media))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link_message))
     
     logger.info("Linko Bot is now running...")
