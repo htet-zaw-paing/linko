@@ -1,4 +1,4 @@
 python-telegram-bot>=21.6
 yt-dlp[default,curl-cffi]>=2025.1.15
 requests>=2.32.0
-mutagen>=1.47.0
+shazamio>=0.5.1
