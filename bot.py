@@ -7,6 +7,9 @@ import shutil
 import time
 import socket
 import ipaddress
+import base64
+import subprocess
+import requests
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
@@ -27,24 +30,37 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 PORT = int(os.environ.get("PORT", 8080))
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 4))
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 USER_COOLDOWN_SECONDS = int(os.environ.get("USER_COOLDOWN_SECONDS", 15))
 user_last_request: dict[int, float] = {}
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
+
 QUALITY_PRESETS = {
     "standard": {"label": "Standard (128 kbps - Smaller Size)", "bitrate": "128"},
     "medium": {"label": "Medium (192 kbps - Balanced)", "bitrate": "192"},
     "high": {"label": "High (320 kbps - Best Quality)", "bitrate": "320"},
 }
 
+# Load Cookies from Render Environment Variables for Instagram/YouTube Login Bypass
+COOKIES_B64 = os.environ.get("COOKIES_B64", "").strip()
+COOKIES_FILE_PATH = "/tmp/linko_cookies.txt"
+if COOKIES_B64:
+    try:
+        with open(COOKIES_FILE_PATH, "wb") as f:
+            f.write(base64.b64decode(COOKIES_B64))
+        logger.info("Loaded custom cookies.txt from COOKIES_B64 environment variable.")
+    except Exception as e:
+        logger.warning(f"Failed to decode COOKIES_B64: {e}")
+
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-
     def do_HEAD(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
@@ -77,18 +93,12 @@ def is_safe_public_url(text: str) -> tuple[bool, str]:
     try:
         result = urlparse(text.strip())
         if result.scheme not in ("http", "https") or not result.netloc:
-            return (
-                False,
-                "Please provide a valid URL starting with `http://` or `https://`.",
-            )
+            return (False, "Please provide a valid URL starting with `http://` or `https://`.")
         hostname = result.hostname
         if not hostname:
             return (False, "Could not determine the website hostname.")
         if hostname.lower() in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-            return (
-                False,
-                "Localhost and internal network links are blocked for security.",
-            )
+            return (False, "Localhost and internal network links are blocked for security.")
         addr_info = socket.getaddrinfo(hostname, None)
         for item in addr_info:
             ip_str = item[4][0]
@@ -100,33 +110,34 @@ def is_safe_public_url(text: str) -> tuple[bool, str]:
                 or ip_obj.is_multicast
                 or ip_obj.is_reserved
             ):
-                return (
-                    False,
-                    "Internal or private network addresses are not permitted.",
-                )
+                return (False, "Internal or private network addresses are not permitted.")
         return (True, "")
     except socket.gaierror:
-        return (
-            False,
-            "Could not resolve that website domain. Please check the link for typos.",
-        )
+        return (False, "Could not resolve that website domain. Please check the link for typos.")
     except Exception:
         return (False, "Invalid URL format.")
 
 
 def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
+    """Downloads audio utilizing yt-dlp mobile spoofing and Cobalt API Fallback."""
+    job_dir = os.path.dirname(output_template)
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": output_template,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "geo_bypass": False,
+        "geo_bypass": True,
         "socket_timeout": 30,
         "retries": 2,
         "extractor_retries": 2,
         "fragment_retries": 2,
         "max_filesize": 50 * 1024 * 1024,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "android_vr", "tv", "mweb", "web"],
+            }
+        },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         },
@@ -138,63 +149,109 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str) -> dict:
             }
         ],
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        if not info:
-            raise ValueError("Unable to retrieve media information.")
-        if info.get("is_live"):
-            raise ValueError("Live streams cannot be downloaded.")
-        duration = info.get("duration") or 0
-        if duration > MAX_DURATION_SECONDS:
-            max_mins = MAX_DURATION_SECONDS // 60
-            raise ValueError(
-                f"Media duration ({duration // 60} mins) exceeds the {max_mins}-minute policy limit."
-            )
-        info = ydl.process_ie_result(info, download=True)
-        return {
-            "title": info.get("title", "Audio Track"),
-            "uploader": info.get("uploader", "Linko Bot"),
-            "duration": duration,
-            "webpage_url": info.get("webpage_url", url),
+
+    if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
+        ydl_opts["cookiefile"] = COOKIES_FILE_PATH
+
+    # Engine 1: yt-dlp with anti-bot bypass
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                raise ValueError("Unable to retrieve media information.")
+            if info.get("is_live"):
+                raise ValueError("Live streams cannot be downloaded.")
+            duration = info.get("duration") or 0
+            if duration > MAX_DURATION_SECONDS:
+                max_mins = MAX_DURATION_SECONDS // 60
+                raise ValueError(f"Media duration ({duration // 60} mins) exceeds the {max_mins}-minute policy limit.")
+            
+            info = ydl.process_ie_result(info, download=True)
+            return {
+                "title": info.get("title", "Audio Track"),
+                "uploader": info.get("uploader", "Linko Bot"),
+                "duration": duration,
+                "webpage_url": info.get("webpage_url", url),
+            }
+            
+    except Exception as ytdlp_error:
+        logger.warning(f"yt-dlp blocked for {url}: {ytdlp_error}. Engaging Cobalt Fallback API...")
+        
+        # Engine 2: Cobalt API Fallback (Bypasses Datacenter IP Blocks)
+        payload = {
+            "url": url,
+            "downloadMode": "audio",
+            "audioFormat": "mp3",
+            "audioBitrate": bitrate,
         }
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        }
+        endpoints = [
+            "https://cobalt-api.kwiatekmiki.com",
+            "https://cobalt-backend.canine.tools",
+            "https://cbl.wuk.sh"
+        ]
+        
+        for api in endpoints:
+            try:
+                resp = requests.post(api, json=payload, headers=headers, timeout=20)
+                if resp.status_code == 200:
+                    dl_url = resp.json().get("url")
+                    title = resp.json().get("filename", "Linko_Audio").replace("_", " ")
+                    if dl_url:
+                        raw_file = os.path.join(job_dir, "raw_audio_temp")
+                        with requests.get(dl_url, stream=True, timeout=30) as r:
+                            r.raise_for_status()
+                            with open(raw_file, "wb") as f:
+                                for chunk in r.iter_content(chunk_size=65536):
+                                    f.write(chunk)
+                                    
+                        # Force exact bitrate conversion using FFmpeg
+                        final_mp3 = os.path.join(job_dir, f"Linko_{uuid.uuid4().hex[:6]}.mp3")
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-i", raw_file, "-vn", "-ar", "44100", "-ac", "2", "-b:a", f"{bitrate}k", final_mp3],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=True
+                        )
+                        return {
+                            "title": title[:80] or "Audio Track",
+                            "uploader": "Linko Extractor",
+                            "duration": 0,
+                            "webpage_url": url,
+                        }
+            except Exception:
+                continue
+                
+        # If both yt-dlp and fallback fail, raise the original error to the user
+        raise ytdlp_error
 
 
 def explain_download_error(error: Exception) -> str:
     message = str(error).lower()
     if any((term in message for term in ("sign in to confirm", "not a bot"))):
-        return "YouTube is blocking automated requests from this server, so Linko could not retrieve this video. This can happen even for public videos. Try again later or use an authorized source that allows downloads."
-    if any(
-        (
-            term in message
-            for term in ("sign in", "login required", "private", "authentication")
-        )
-    ):
+        return "YouTube/Instagram blocked anonymous access from this server's IP. Add a `COOKIES_B64` environment variable in Render to authenticate requests."
+    if any((term in message for term in ("sign in", "login required", "private", "authentication"))):
         return "This media appears to require login, is private, or is age-restricted. Linko only processes publicly accessible content."
     if "ffmpeg" in message or "ffprobe" in message or "postprocessing" in message:
         return "The MP3 conversion tool is unavailable. Check that the latest Docker image finished building with FFmpeg installed."
     if "unsupported url" in message or "no suitable extractor" in message:
-        return (
-            "This link format is not supported. Send the full public post or video URL."
-        )
+        return "This link format is not supported. Send the full public post or video URL."
     if any((term in message for term in ("file is larger", "filesize", "file size"))):
         return "The source is larger than Linko's 50 MB processing limit."
-    if any(
-        (
-            term in message
-            for term in ("no video formats", "requested format", "no formats")
-        )
-    ):
-        return "The platform did not provide a downloadable audio format for this public link. Try another public post or video."
-    return "The platform did not return downloadable media. Check that the link is public, then try again later; platform access restrictions cannot be bypassed by Linko."
+    if any((term in message for term in ("no video formats", "requested format", "no formats"))):
+        return "The platform did not provide a downloadable audio format for this public link."
+    return "The platform did not return downloadable media. Check that the link is public, then try again later."
 
 
 async def post_init(application) -> None:
     commands = [
         BotCommand("start", "Start Linko Bot and see welcome info"),
         BotCommand("help", "Learn how to download MP3 audio from links"),
-        BotCommand(
-            "quality", "View details about Standard, Medium, and High MP3 modes"
-        ),
+        BotCommand("quality", "View details about Standard, Medium, and High MP3 modes"),
         BotCommand("terms", "Read copyright, platform policy, and security terms"),
         BotCommand("about", "Information about Linko Bot"),
     ]
@@ -224,51 +281,34 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    terms_text = "⚖️ *Platform Policy, Copyright & Security Terms*\n\n1. *Authorized & Fair Use Only:* Linko is strictly intended for downloading your own content, Creative Commons/royalty-free audio, public domain works, or material for which you have explicit permission from the copyright holder.\n\n2. *No DRM or Paywall Circumvention:* Linko respects platform security measures. It does *not* bypass Digital Rights Management (DRM), private accounts, age-restricted gates, or paid subscriptions.\n\n3. *Platform Terms of Service:* Social platforms (such as YouTube, TikTok, Instagram, Facebook, and X) prohibit unauthorized redistribution of copyrighted content. Users are solely responsible for complying with the Terms of Service of the source website.\n\n4. *Zero Retention Privacy:* Downloaded files are processed in isolated temporary folders and permanently deleted from the server immediately after delivery."
+    terms_text = "⚖️ *Platform Policy, Copyright & Security Terms*\n\n1. *Authorized & Fair Use Only:* Linko is strictly intended for downloading your own content, Creative Commons/royalty-free audio, public domain works, or material for which you have explicit permission from the copyright holder.\n\n2. *No DRM or Paywall Circumvention:* Linko respects platform security measures. It does *not* bypass Digital Rights Management (DRM), private accounts, age-restricted gates, or paid subscriptions.\n\n3. *Platform Terms of Service:* Social platforms prohibit unauthorized redistribution of copyrighted content.\n\n4. *Zero Retention Privacy:* Downloaded files are permanently deleted from the server immediately after delivery."
     await update.message.reply_text(terms_text, parse_mode="Markdown")
 
 
-async def handle_link_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     now = time.time()
     last_req = user_last_request.get(user_id, 0)
     if now - last_req < USER_COOLDOWN_SECONDS:
         remaining = int(USER_COOLDOWN_SECONDS - (now - last_req))
-        await update.message.reply_text(
-            f"⏳ Please wait *{remaining} seconds* before submitting another link.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(f"⏳ Please wait *{remaining} seconds* before submitting another link.", parse_mode="Markdown")
         return
+    
     message_text = update.message.text.strip()
     is_safe, error_reason = is_safe_public_url(message_text)
     if not is_safe:
         await update.message.reply_text(f"❌ {error_reason}", parse_mode="Markdown")
         return
+        
     request_id = str(uuid.uuid4())[:8]
     if "links" not in context.user_data:
         context.user_data["links"] = {}
     context.user_data["links"][request_id] = message_text
+    
     keyboard = [
-        [
-            InlineKeyboardButton(
-                "⚪ Standard (128 kbps - ~1 MB/min)",
-                callback_data=f"dl|{request_id}|standard",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔵 Medium (192 kbps - ~1.4 MB/min)",
-                callback_data=f"dl|{request_id}|medium",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💎 High (320 kbps - ~2.4 MB/min)",
-                callback_data=f"dl|{request_id}|high",
-            )
-        ],
+        [InlineKeyboardButton("⚪ Standard (128 kbps - ~1 MB/min)", callback_data=f"dl|{request_id}|standard")],
+        [InlineKeyboardButton("🔵 Medium (192 kbps - ~1.4 MB/min)", callback_data=f"dl|{request_id}|medium")],
+        [InlineKeyboardButton("💎 High (320 kbps - ~2.4 MB/min)", callback_data=f"dl|{request_id}|high")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"dl|{request_id}|cancel")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -279,56 +319,49 @@ async def handle_link_message(
     )
 
 
-async def handle_quality_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def handle_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     try:
         _, request_id, quality_key = query.data.split("|")
     except ValueError:
-        await query.edit_message_text(
-            "⚠️ Invalid selection. Please send the link again."
-        )
+        await query.edit_message_text("⚠️ Invalid selection. Please send the link again.")
         return
+        
     if quality_key == "cancel":
         context.user_data.get("links", {}).pop(request_id, None)
         await query.edit_message_text("🚫 Download request cancelled.")
         return
+        
     url = context.user_data.get("links", {}).get(request_id)
     if not url:
-        await query.edit_message_text(
-            "⏳ This session expired. Please paste your link again."
-        )
+        await query.edit_message_text("⏳ This session expired. Please paste your link again.")
         return
+        
     user_last_request[update.effective_user.id] = time.time()
     preset = QUALITY_PRESETS.get(quality_key, QUALITY_PRESETS["medium"])
     bitrate = preset["bitrate"]
+    
     await query.edit_message_text(
         f"⏳ *Queued for processing...*\nQuality: `{preset['label']}`\nPlease wait while Linko prepares your MP3.",
         parse_mode="Markdown",
     )
+    
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
     output_template = os.path.join(job_dir, "%(title).80s.%(ext)s")
+    
     try:
         async with download_semaphore:
-            await query.edit_message_text(
-                f"⚙️ *Verifying & converting to MP3 ({bitrate} kbps)...*",
-                parse_mode="Markdown",
-            )
-            metadata = await asyncio.to_thread(
-                BlockingDownloadAudio, url, bitrate, output_template
-            )
-        mp3_files = [
-            os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(".mp3")
-        ]
+            await query.edit_message_text(f"⚙️ *Verifying & converting to MP3 ({bitrate} kbps)...*", parse_mode="Markdown")
+            metadata = await asyncio.to_thread(BlockingDownloadAudio, url, bitrate, output_template)
+            
+        mp3_files = [os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(".mp3")]
         if not mp3_files:
-            await query.edit_message_text(
-                "❌ Failed to extract an MP3 file from this link. Make sure the link is public and contains audio."
-            )
+            await query.edit_message_text("❌ Failed to extract an MP3 file from this link. Make sure the link is public and contains audio.")
             return
+            
         mp3_path = mp3_files[0]
         file_size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
         if file_size_mb > 49.5:
@@ -337,32 +370,25 @@ async def handle_quality_callback(
                 parse_mode="Markdown",
             )
             return
-        await query.edit_message_text(
-            "📤 *Uploading MP3 to Telegram...*", parse_mode="Markdown"
-        )
+            
+        await query.edit_message_text("📤 *Uploading MP3 to Telegram...*", parse_mode="Markdown")
         with open(mp3_path, "rb") as audio_file:
             await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
                 audio=audio_file,
-                title=metadata.get("title", "Audio"),
-                performer=metadata.get("uploader", "Linko"),
+                title=metadata.get("title", "Audio").replace("_", " "),
+                performer=metadata.get("uploader", "Linko").replace("_", " "),
                 caption=f"*Downloaded via Linko*\n*Quality:* {bitrate} kbps MP3\n*Size:* {file_size_mb:.2f} MB",
                 parse_mode="Markdown",
             )
         await query.delete_message()
+        
     except ValueError as ve:
-        await query.edit_message_text(
-            f"⚠️ *Policy Notice:* {ve}", parse_mode="Markdown"
-        )
+        await query.edit_message_text(f"⚠️ *Policy Notice:* {ve}", parse_mode="Markdown")
     except Exception as e:
         host = urlparse(url).hostname or "unknown host"
-        safe_detail = re.sub("https?://[^\\s]+", "[URL]", str(e))[:500]
-        logger.error(
-            "Media processing failed for host=%s (%s): %s",
-            host,
-            type(e).__name__,
-            safe_detail,
-        )
+        safe_detail = re.sub(r"https?://[^\s]+", "[URL]", str(e))[:500]
+        logger.error("Media processing failed for host=%s (%s): %s", host, type(e).__name__, safe_detail)
         await query.edit_message_text(
             f"❌ *Unable to process this link.*\n\n{explain_download_error(e)}\n\nMake sure you have permission to download the content. Linko does not bypass private access, DRM, or platform restrictions.",
             parse_mode="Markdown",
@@ -390,12 +416,9 @@ def main() -> None:
     application.add_handler(CommandHandler("quality", quality_command))
     application.add_handler(CommandHandler("terms", terms_command))
     application.add_handler(CommandHandler("about", about_command))
-    application.add_handler(
-        CallbackQueryHandler(handle_quality_callback, pattern="^dl\\|")
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link_message)
-    )
+    application.add_handler(CallbackQueryHandler(handle_quality_callback, pattern="^dl\\|"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link_message))
+    
     logger.info("Linko Bot is now running...")
     application.run_polling(drop_pending_updates=True)
 
