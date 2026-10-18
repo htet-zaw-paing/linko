@@ -14,12 +14,13 @@ import requests
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    InlineQueryHandler,
     ContextTypes,
     filters,
 )
@@ -48,6 +49,8 @@ user_last_request: dict[int, float] = {}
 user_active_tasks: dict[int, int] = {}
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 MAX_PLAYLIST_ITEMS = 10
+
+GLOBAL_SESSION = {} # Used specifically for Inline Search and Clips
 
 QUALITY_PRESETS = {
     "standard": {"label": "Standard Audio (MP3)", "bitrate": "128", "type": "audio"},
@@ -138,7 +141,15 @@ def fetch_lrclib_lyrics(query: str) -> str:
         pass
     return ""
 
-def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice: bool = False) -> dict:
+def parse_time_to_seconds(t_str: str) -> int:
+    parts = t_str.split(":")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    elif len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    return int(t_str)
+
+def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice: bool = False, start_sec: int = None, end_sec: int = None) -> dict:
     job_dir = os.path.dirname(output_template)
     ydl_opts = {
         "format": "bestaudio/best",
@@ -164,6 +175,10 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
         },
     }
 
+    if start_sec is not None and end_sec is not None:
+        ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)])
+        ydl_opts["force_keyframes_at_cuts"] = True
+
     if not is_voice:
         ydl_opts["postprocessors"] = [
             {
@@ -187,10 +202,14 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
                 raise ValueError("Could not read the media information.")
             if info.get("is_live"):
                 raise ValueError("Live streams cannot be downloaded.")
+                
             duration = info.get("duration") or 0
-            if duration > MAX_DURATION_SECONDS:
-                max_mins = MAX_DURATION_SECONDS // 60
-                raise ValueError(f"The media is longer than the {max_mins}-minute limit.")
+            if start_sec is not None and end_sec is not None:
+                clip_duration = end_sec - start_sec
+                if clip_duration > MAX_DURATION_SECONDS:
+                    raise ValueError(f"Clip cannot be longer than {MAX_DURATION_SECONDS // 60} minutes.")
+            elif duration > MAX_DURATION_SECONDS:
+                raise ValueError(f"The media is longer than the {MAX_DURATION_SECONDS // 60}-minute limit.")
             
             info = ydl.process_ie_result(info, download=True)
 
@@ -215,6 +234,9 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
             }
             
     except Exception as ytdlp_error:
+        if start_sec is not None:
+            raise ValueError("Clipping failed. This link might not support timestamps.")
+            
         payload = {
             "url": url,
             "downloadMode": "audio",
@@ -274,31 +296,33 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
                 
         raise ytdlp_error
 
-def BlockingDownloadVideo(url: str, output_template: str) -> dict:
+def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None, end_sec: int = None) -> dict:
     job_dir = os.path.dirname(output_template)
-    payload = {"url": url, "downloadMode": "auto"}
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    endpoints = [
-        "https://cobalt-api.kwiatekmiki.com",
-        "https://cobalt-backend.canine.tools",
-        "https://cbl.wuk.sh"
-    ]
     
-    for api in endpoints:
-        try:
-            resp = requests.post(api, json=payload, headers=headers, timeout=15)
-            if resp.status_code == 200 and resp.json().get("url"):
-                dl_url = resp.json().get("url")
-                title = resp.json().get("filename", "Video").replace("_", " ")
-                final_mp4 = os.path.join(job_dir, "video_track.mp4")
-                with requests.get(dl_url, stream=True, timeout=30) as r:
-                    r.raise_for_status()
-                    with open(final_mp4, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=65536):
-                            f.write(chunk)
-                return {"title": title[:80] or "Video", "uploader": "Linko"}
-        except Exception:
-            continue
+    if start_sec is None:
+        payload = {"url": url, "downloadMode": "auto"}
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        endpoints = [
+            "https://cobalt-api.kwiatekmiki.com",
+            "https://cobalt-backend.canine.tools",
+            "https://cbl.wuk.sh"
+        ]
+        
+        for api in endpoints:
+            try:
+                resp = requests.post(api, json=payload, headers=headers, timeout=15)
+                if resp.status_code == 200 and resp.json().get("url"):
+                    dl_url = resp.json().get("url")
+                    title = resp.json().get("filename", "Video").replace("_", " ")
+                    final_mp4 = os.path.join(job_dir, "video_track.mp4")
+                    with requests.get(dl_url, stream=True, timeout=30) as r:
+                        r.raise_for_status()
+                        with open(final_mp4, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=65536):
+                                f.write(chunk)
+                    return {"title": title[:80] or "Video", "uploader": "Linko"}
+            except Exception:
+                continue
             
     ydl_opts = {
         "format": "best[ext=mp4]/best",
@@ -316,6 +340,10 @@ def BlockingDownloadVideo(url: str, output_template: str) -> dict:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         },
     }
+    
+    if start_sec is not None and end_sec is not None:
+        ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)])
+        ydl_opts["force_keyframes_at_cuts"] = True
     
     if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
         ydl_opts["cookiefile"] = COOKIES_FILE_PATH
@@ -344,6 +372,7 @@ async def post_init(application) -> None:
     commands = [
         BotCommand("start", "Start the bot"),
         BotCommand("search", "Search for songs"),
+        BotCommand("clip", "Clip specific audio/video parts"),
         BotCommand("trending", "See top trending songs"),
         BotCommand("help", "Learn how to use the bot"),
         BotCommand("quality", "See audio quality options"),
@@ -361,11 +390,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Here is what I can do:\n\n"
         "<b>1. Download Media</b>\n"
         "Send me any public video or audio link.\n\n"
-        "<b>2. Search Music</b>\n"
-        "Type /search [song name] to find tracks.\n\n"
-        "<b>3. Top Hits</b>\n"
-        "Type /trending to see popular songs.\n\n"
-        "<b>4. Identify Music</b>\n"
+        "<b>2. Smart Clipper (New!)</b>\n"
+        "Type /clip [link] 01:15-01:45 to save a specific part.\n\n"
+        "<b>3. Inline Search (New!)</b>\n"
+        "Type @Linko4UBot in ANY chat to find and share music.\n\n"
+        "<b>4. Search & Trending</b>\n"
+        "Type /search [song name] or /trending.\n\n"
+        "<b>5. Identify Music</b>\n"
         "Forward a voice note or audio clip to find out its name.\n\n"
         "<b>Guides:</b>\n"
         "• <a href='https://telegra.ph/Linko---User-Guide-10-17'>Read the English Guide</a>\n"
@@ -383,6 +414,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Linko Help Guide\n\n"
         "How to use:\n"
         "- Send a web link (YouTube, TikTok, Instagram Reels, etc.).\n"
+        "- Type /clip [link] [start]-[end] to cut parts.\n"
+        "- Type @Linko4UBot in any chat for inline search.\n"
         "- Send a voice note or audio file to identify the song.\n"
         "- Type /search [song name] or /trending.\n\n"
         "Download Options:\n"
@@ -462,6 +495,41 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+async def clip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("✂️ *Smart Clipper*\nUsage: `/clip [link] [start]-[end]`\nExample: `/clip https://youtu.be/xyz 01:15-01:45`", parse_mode="Markdown")
+        return
+        
+    url = args[0]
+    timestamps = "".join(args[1:])
+    
+    if "-" not in timestamps:
+        await update.message.reply_text("❌ Please use the format start-end (e.g., 01:15-01:45).")
+        return
+        
+    try:
+        start_str, end_str = timestamps.split("-", 1)
+        start_sec = parse_time_to_seconds(start_str)
+        end_sec = parse_time_to_seconds(end_str)
+    except Exception:
+        await update.message.reply_text("❌ Invalid time format. Use MM:SS.")
+        return
+
+    is_safe, error_reason = is_safe_public_url(url)
+    if not is_safe:
+        await update.message.reply_text(f"❌ {error_reason}")
+        return
+
+    req_id = str(uuid.uuid4())[:8]
+    GLOBAL_SESSION[req_id] = {"url": url, "start": start_sec, "end": end_sec}
+    
+    keyboard = [
+        [InlineKeyboardButton("Clip Audio (MP3)", callback_data=f"dlc|{req_id}|high")],
+        [InlineKeyboardButton("Clip Video (MP4)", callback_data=f"dlvc|{req_id}")]
+    ]
+    await update.message.reply_text(f"✂️ Clipping from {start_str} to {end_str}.\nChoose format:", reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("Getting the top trending songs...")
     try:
@@ -520,6 +588,48 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.edit_text("Search Results (Select a track):", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception:
         await msg.edit_text("Search failed. Please try again later.")
+
+async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.inline_query.query.strip()
+    if not query:
+        return
+        
+    def do_search():
+        with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True}) as ydl:
+            return ydl.extract_info(f"ytsearch5:{query}", download=False)
+            
+    try:
+        info = await asyncio.to_thread(do_search)
+        results = []
+        for entry in info.get("entries", []):
+            url = entry.get("url")
+            if not url: continue
+            
+            req_id = str(uuid.uuid4())[:8]
+            GLOBAL_SESSION[req_id] = {"url": url}
+            title = entry.get("title", "Unknown")[:50]
+            
+            keyboard = [
+                [InlineKeyboardButton("Audio (MP3)", callback_data=f"dli|{req_id}|high"),
+                 InlineKeyboardButton("Video (MP4)", callback_data=f"dlvi|{req_id}")]
+            ]
+            
+            results.append(
+                InlineQueryResultArticle(
+                    id=req_id,
+                    title=title,
+                    description=f"by {entry.get('uploader', 'Unknown')}",
+                    input_message_content=InputTextMessageContent(
+                        f"🎵 <b>{title}</b>\n🔗 {url}", 
+                        parse_mode="HTML", 
+                        disable_web_page_preview=True
+                    ),
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            )
+        await update.inline_query.answer(results, cache_time=10)
+    except Exception as e:
+        logger.error(f"Inline search error: {e}")
 
 async def handle_audio_recognition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("Audio received. Identifying the song...")
@@ -619,7 +729,7 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text("Link verified! Choose your download format:", reply_markup=reply_markup)
 
-async def execute_video_download(chat_id, url, context, status_msg=None):
+async def execute_video_download(chat_id, url, context, status_msg=None, start_sec=None, end_sec=None):
     async def update_status(text):
         if status_msg:
             try:
@@ -627,7 +737,11 @@ async def execute_video_download(chat_id, url, context, status_msg=None):
             except Exception:
                 pass
 
-    await update_status("Downloading video without watermark...")
+    if start_sec is not None:
+        await update_status("Clipping video directly from the server...")
+    else:
+        await update_status("Downloading video without watermark...")
+        
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -635,7 +749,7 @@ async def execute_video_download(chat_id, url, context, status_msg=None):
     
     try:
         async with download_semaphore:
-            metadata = await asyncio.to_thread(BlockingDownloadVideo, url, output_template)
+            metadata = await asyncio.to_thread(BlockingDownloadVideo, url, output_template, start_sec, end_sec)
             
         mp4_path = os.path.join(job_dir, "video_track.mp4")
         if not os.path.exists(mp4_path):
@@ -669,7 +783,7 @@ async def execute_video_download(chat_id, url, context, status_msg=None):
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
 
-async def execute_download(chat_id, url, preset_key, context, status_msg=None, status_prefix=""):
+async def execute_download(chat_id, url, preset_key, context, status_msg=None, status_prefix="", start_sec=None, end_sec=None):
     preset = QUALITY_PRESETS.get(preset_key, QUALITY_PRESETS["medium"])
     bitrate = preset["bitrate"]
     is_voice = preset["type"] == "voice"
@@ -681,7 +795,10 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
             except Exception: 
                 pass
 
-    await update_status(f"{status_prefix}Downloading ({preset['label']})...\nPlease wait, this might take a minute or two.")
+    if start_sec is not None:
+        await update_status(f"{status_prefix}Clipping {preset['label']}...\nPlease wait, this might take a minute.")
+    else:
+        await update_status(f"{status_prefix}Downloading ({preset['label']})...\nPlease wait, this might take a minute or two.")
     
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
@@ -690,7 +807,7 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
     
     try:
         async with download_semaphore:
-            metadata = await asyncio.to_thread(BlockingDownloadAudio, url, bitrate, output_template, is_voice)
+            metadata = await asyncio.to_thread(BlockingDownloadAudio, url, bitrate, output_template, is_voice, start_sec, end_sec)
             
         target_ext = ".ogg" if is_voice else ".mp3"
         files = [os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(target_ext)]
@@ -815,50 +932,77 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ]
         return await query.edit_message_text("Select audio quality:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    if data.startswith("dlv"):
+    parts = data.split("|")
+    prefix = parts[0]
+
+    # Handle all Video Downloads (Regular, Inline, and Clips)
+    if prefix in ("dlv", "dlvi", "dlvc"):
         if user_active_tasks.get(user_id, 0) > 0:
             await query.edit_message_text("⚠️ Please wait! Your previous file is still processing.")
             return
 
-        req_id = data.split("|")[1]
-        url = context.user_data.get("links", {}).pop(req_id, None)
-        if not url:
-            await query.edit_message_text("Your session expired. Please send the link again.")
-            return
+        req_id = parts[1]
+        start_sec, end_sec = None, None
+        
+        if prefix in ("dlvi", "dlvc"):
+            session = GLOBAL_SESSION.pop(req_id, None)
+            if not session:
+                await query.edit_message_text("Your session expired. Please search or clip again.")
+                return
+            url = session.get("url")
+            start_sec = session.get("start")
+            end_sec = session.get("end")
+        else:
+            url = context.user_data.get("links", {}).pop(req_id, None)
+            if not url:
+                await query.edit_message_text("Your session expired. Please send the link again.")
+                return
 
         user_last_request[user_id] = time.time()
         user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
         
         try:
-            await query.edit_message_text("Added to queue...")
-            await execute_video_download(update.effective_chat.id, url, context, query.message)
+            msg = "Added to queue..." if start_sec is None else "Added clip to queue..."
+            await query.edit_message_text(msg)
+            await execute_video_download(update.effective_chat.id, url, context, query.message, start_sec, end_sec)
         finally:
             if user_active_tasks[user_id] > 0:
                 user_active_tasks[user_id] -= 1
         return
 
-    if data.startswith("dl"):
+    # Handle all Audio Downloads (Regular, Playlist, Inline, and Clips)
+    if prefix in ("dl", "dlpl", "dli", "dlc"):
         if user_active_tasks.get(user_id, 0) > 0:
             await query.edit_message_text("⚠️ Please wait! Your previous file is still processing.")
             return
 
-        parts = data.split("|")
-        prefix, req_id, quality_key = parts[0], parts[1], parts[2]
+        req_id = parts[1]
+        quality_key = parts[2]
+        start_sec, end_sec = None, None
         
-        url = context.user_data.get("links", {}).pop(req_id, None)
-        if not url:
-            await query.edit_message_text("Your session expired. Please send the link again.")
-            return
+        if prefix in ("dli", "dlc"):
+            session = GLOBAL_SESSION.pop(req_id, None)
+            if not session:
+                await query.edit_message_text("Your session expired. Please search or clip again.")
+                return
+            url = session.get("url")
+            start_sec = session.get("start")
+            end_sec = session.get("end")
+        else:
+            url = context.user_data.get("links", {}).pop(req_id, None)
+            if not url:
+                await query.edit_message_text("Your session expired. Please send the link again.")
+                return
             
         user_last_request[user_id] = time.time()
         preset = QUALITY_PRESETS.get(quality_key, QUALITY_PRESETS["medium"])
-        
         user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
         
         try:
-            if prefix == "dl":
-                await query.edit_message_text(f"Added to queue ({preset['label']})...")
-                await execute_download(update.effective_chat.id, url, quality_key, context, query.message)
+            if prefix in ("dl", "dli", "dlc"):
+                msg = f"Added to queue ({preset['label']})..." if start_sec is None else f"Added clip to queue ({preset['label']})..."
+                await query.edit_message_text(msg)
+                await execute_download(update.effective_chat.id, url, quality_key, context, query.message, "", start_sec, end_sec)
             else:
                 await query.edit_message_text("Loading playlist details...")
                 def get_playlist():
@@ -911,6 +1055,7 @@ def main() -> None:
     )
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("clip", clip_command))
     application.add_handler(CommandHandler("trending", trending_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("quality", quality_command))
@@ -918,6 +1063,7 @@ def main() -> None:
     application.add_handler(CommandHandler("feedback", feedback_command))
     application.add_handler(CommandHandler("terms", terms_command))
     application.add_handler(CommandHandler("about", about_command))
+    application.add_handler(InlineQueryHandler(inline_search))
     application.add_handler(CallbackQueryHandler(handle_callbacks))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio_recognition))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO, handle_media))
