@@ -347,7 +347,7 @@ async def post_init(application) -> None:
         BotCommand("trending", "See top trending songs"),
         BotCommand("help", "Learn how to use the bot"),
         BotCommand("quality", "See audio quality options"),
-        BotCommand("donate", "Support Linko (Buy me a coffee)"),
+        BotCommand("donate", "Support Linko"),
         BotCommand("feedback", "Send suggestions and feedback"),
         BotCommand("terms", "Rules and privacy terms"),
         BotCommand("about", "About Linko"),
@@ -407,13 +407,14 @@ async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     about_text = (
-        "About Linko\n\n"
-        "Linko is a free bot designed to download public media and music easily.\n\n"
-        "Built with Python, yt-dlp, FFmpeg, and ShazamIO.\n\n"
-        "👨‍💻 Developed by Htet Zaw Paing\n"
-        "🏢 A project by MyanCode"
+        "<b>About Linko</b>\n\n"
+        "Linko is a streamlined Telegram utility designed to simplify media downloading and music discovery.\n\n"
+        "The bot allows users to save watermark-free videos, convert public web links into audio files, and identify playing music. It processes all requests directly within the chat and includes built-in features such as music search, trending charts, and lyrics retrieval.\n\n"
+        "To ensure reliable performance, the system is powered by Python, yt-dlp, FFmpeg, and ShazamIO.\n\n"
+        "Developed and maintained by <a href='https://www.htetzawpaing.site'>Htet Zaw Paing</a>.\n"
+        "A project by <a href='https://www.myancode.com'>MyanCode</a>."
     )
-    await update.message.reply_text(about_text)
+    await update.message.reply_text(about_text, parse_mode="HTML")
 
 async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     terms_text = (
