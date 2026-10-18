@@ -10,6 +10,7 @@ import ipaddress
 import base64
 import subprocess
 import urllib.parse
+import gc
 import requests
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -42,15 +43,20 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 FEEDBACK_URL = os.environ.get("FEEDBACK_URL", "https://forms.gle/4u6R2iG8vFj5A7Q77")
 KBZPAY_QR_URL = os.environ.get("KBZPAY_QR_URL", "")
 
-MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 4))
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 2))
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-USER_COOLDOWN_SECONDS = int(os.environ.get("USER_COOLDOWN_SECONDS", 15))
+USER_COOLDOWN_SECONDS = int(os.environ.get("USER_COOLDOWN_SECONDS", 10))
 user_last_request: dict[int, float] = {}
 user_active_tasks: dict[int, int] = {}
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 MAX_PLAYLIST_ITEMS = 10
 
-GLOBAL_SESSION = {} # Used specifically for Inline Search and Clips
+# Dynamic Queue Manager
+MAX_QUEUE_CAPACITY = 100
+current_in_queue = 0
+queue_counter_lock = asyncio.Lock()
+
+GLOBAL_SESSION = {}
 
 QUALITY_PRESETS = {
     "standard": {"label": "Standard Audio (MP3)", "bitrate": "128", "type": "audio"},
@@ -151,6 +157,83 @@ def parse_time_to_seconds(t_str: str) -> int:
 
 def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice: bool = False, start_sec: int = None, end_sec: int = None) -> dict:
     job_dir = os.path.dirname(output_template)
+
+    if start_sec is None:
+        payload = {
+            "url": url,
+            "downloadMode": "audio",
+            "audioFormat": "mp3",
+            "audioBitrate": bitrate,
+        }
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        }
+        endpoints = [
+            "https://cobalt-api.kwiatekmiki.com",
+            "https://cobalt-backend.canine.tools",
+            "https://cbl.wuk.sh"
+        ]
+        
+        for api in endpoints:
+            try:
+                resp = requests.post(api, json=payload, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    dl_url = resp.json().get("url")
+                    title = resp.json().get("filename", "Audio").replace("_", " ")
+                    if dl_url:
+                        # Direct URL Bypass Check for Audio < 20MB (Telegram limit)
+                        # Voice messages must be transcoded locally to OGG, so bypass only applies to MP3
+                        if not is_voice:
+                            try:
+                                head_resp = requests.head(dl_url, timeout=10)
+                                size = int(head_resp.headers.get("Content-Length", 0))
+                                if 0 < size < 19.5 * 1024 * 1024:
+                                    return {
+                                        "title": title[:80] or "Audio Track",
+                                        "uploader": "Linko",
+                                        "duration": 0,
+                                        "webpage_url": url,
+                                        "direct_url": dl_url
+                                    }
+                            except Exception:
+                                pass
+
+                        # Fallback to local download if bypass fails or voice mode is active
+                        raw_file = os.path.join(job_dir, "raw_audio_temp")
+                        with requests.get(dl_url, stream=True, timeout=25) as r:
+                            r.raise_for_status()
+                            with open(raw_file, "wb") as f:
+                                for chunk in r.iter_content(chunk_size=65536):
+                                    f.write(chunk)
+                        
+                        if is_voice:
+                            final_ogg = os.path.join(job_dir, "voice_track.ogg")
+                            subprocess.run(
+                                ["ffmpeg", "-y", "-i", raw_file, "-c:a", "libopus", "-b:a", f"{bitrate}k", final_ogg],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=True
+                            )
+                        else:
+                            final_mp3 = os.path.join(job_dir, "audio_track.mp3")
+                            subprocess.run(
+                                ["ffmpeg", "-y", "-i", raw_file, "-vn", "-ar", "44100", "-ac", "2", "-b:a", f"{bitrate}k", final_mp3],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=True
+                            )
+
+                        return {
+                            "title": title[:80] or "Audio Track",
+                            "uploader": "Linko",
+                            "duration": 0,
+                            "webpage_url": url,
+                        }
+            except Exception:
+                continue
+
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": output_template,
@@ -195,106 +278,42 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
     if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
         ydl_opts["cookiefile"] = COOKIES_FILE_PATH
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                raise ValueError("Could not read the media information.")
-            if info.get("is_live"):
-                raise ValueError("Live streams cannot be downloaded.")
-                
-            duration = info.get("duration") or 0
-            if start_sec is not None and end_sec is not None:
-                clip_duration = end_sec - start_sec
-                if clip_duration > MAX_DURATION_SECONDS:
-                    raise ValueError(f"Clip cannot be longer than {MAX_DURATION_SECONDS // 60} minutes.")
-            elif duration > MAX_DURATION_SECONDS:
-                raise ValueError(f"The media is longer than the {MAX_DURATION_SECONDS // 60}-minute limit.")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if not info:
+            raise ValueError("Could not read the media information.")
+        if info.get("is_live"):
+            raise ValueError("Live streams cannot be downloaded.")
             
-            info = ydl.process_ie_result(info, download=True)
-
-            if is_voice:
-                raw_file = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.startswith("audio_track")), None)
-                if raw_file:
-                    final_ogg = os.path.join(job_dir, "voice_track.ogg")
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-i", raw_file, "-c:a", "libopus", "-b:a", f"{bitrate}k", final_ogg],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=True
-                    )
-                    if os.path.exists(raw_file):
-                        os.remove(raw_file)
-
-            return {
-                "title": info.get("title", "Audio Track"),
-                "uploader": info.get("uploader", "Linko"),
-                "duration": duration,
-                "webpage_url": info.get("webpage_url", url),
-            }
-            
-    except Exception as ytdlp_error:
-        if start_sec is not None:
-            raise ValueError("Clipping failed. This link might not support timestamps.")
-            
-        payload = {
-            "url": url,
-            "downloadMode": "audio",
-            "audioFormat": "mp3",
-            "audioBitrate": bitrate,
-        }
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        }
-        endpoints = [
-            "https://cobalt-api.kwiatekmiki.com",
-            "https://cobalt-backend.canine.tools",
-            "https://cbl.wuk.sh"
-        ]
+        duration = info.get("duration") or 0
+        if start_sec is not None and end_sec is not None:
+            clip_duration = end_sec - start_sec
+            if clip_duration > MAX_DURATION_SECONDS:
+                raise ValueError(f"Clip cannot be longer than {MAX_DURATION_SECONDS // 60} minutes.")
+        elif duration > MAX_DURATION_SECONDS:
+            raise ValueError(f"The media is longer than the {MAX_DURATION_SECONDS // 60}-minute limit.")
         
-        for api in endpoints:
-            try:
-                resp = requests.post(api, json=payload, headers=headers, timeout=15)
-                if resp.status_code == 200:
-                    dl_url = resp.json().get("url")
-                    title = resp.json().get("filename", "Audio").replace("_", " ")
-                    if dl_url:
-                        raw_file = os.path.join(job_dir, "raw_audio_temp")
-                        with requests.get(dl_url, stream=True, timeout=25) as r:
-                            r.raise_for_status()
-                            with open(raw_file, "wb") as f:
-                                for chunk in r.iter_content(chunk_size=65536):
-                                    f.write(chunk)
-                        
-                        if is_voice:
-                            final_ogg = os.path.join(job_dir, "voice_track.ogg")
-                            subprocess.run(
-                                ["ffmpeg", "-y", "-i", raw_file, "-c:a", "libopus", "-b:a", f"{bitrate}k", final_ogg],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                check=True
-                            )
-                        else:
-                            final_mp3 = os.path.join(job_dir, "audio_track.mp3")
-                            subprocess.run(
-                                ["ffmpeg", "-y", "-i", raw_file, "-vn", "-ar", "44100", "-ac", "2", "-b:a", f"{bitrate}k", final_mp3],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                check=True
-                            )
+        info = ydl.process_ie_result(info, download=True)
 
-                        return {
-                            "title": title[:80] or "Audio Track",
-                            "uploader": "Linko",
-                            "duration": 0,
-                            "webpage_url": url,
-                        }
-            except Exception:
-                continue
-                
-        raise ytdlp_error
+        if is_voice:
+            raw_file = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.startswith("audio_track")), None)
+            if raw_file:
+                final_ogg = os.path.join(job_dir, "voice_track.ogg")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", raw_file, "-c:a", "libopus", "-b:a", f"{bitrate}k", final_ogg],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True
+                )
+                if os.path.exists(raw_file):
+                    os.remove(raw_file)
+
+        return {
+            "title": info.get("title", "Audio Track"),
+            "uploader": info.get("uploader", "Linko"),
+            "duration": duration,
+            "webpage_url": info.get("webpage_url", url),
+        }
 
 def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None, end_sec: int = None) -> dict:
     job_dir = os.path.dirname(output_template)
@@ -314,6 +333,16 @@ def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None,
                 if resp.status_code == 200 and resp.json().get("url"):
                     dl_url = resp.json().get("url")
                     title = resp.json().get("filename", "Video").replace("_", " ")
+                    
+                    # Direct URL Bypass Check for Video < 20MB (Telegram limit)
+                    try:
+                        head_resp = requests.head(dl_url, timeout=10)
+                        size = int(head_resp.headers.get("Content-Length", 0))
+                        if 0 < size < 19.5 * 1024 * 1024:
+                            return {"title": title[:80] or "Video", "uploader": "Linko", "direct_url": dl_url}
+                    except Exception:
+                        pass
+
                     final_mp4 = os.path.join(job_dir, "video_track.mp4")
                     with requests.get(dl_url, stream=True, timeout=30) as r:
                         r.raise_for_status()
@@ -387,12 +416,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     args = context.args
     user_id = update.effective_user.id
     
-    # --- NEW: Intercept Deep Links from Inline Search ---
     if args:
         payload = args[0]
         if payload.startswith("dli_") or payload.startswith("dlvi_"):
             if user_active_tasks.get(user_id, 0) > 0:
-                await update.message.reply_text("⚠️ Please wait! Your previous file is still processing.")
+                await update.message.reply_text("Please wait. Your previous file is still processing.")
                 return
             
             parts = payload.split("_")
@@ -402,7 +430,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
             session = GLOBAL_SESSION.pop(req_id, None)
             if not session:
-                await update.message.reply_text("❌ This link has expired. Please search again.")
+                await update.message.reply_text("This link has expired. Please search again.")
                 return
             
             url = session.get("url")
@@ -410,7 +438,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
             
             try:
-                status_msg = await update.message.reply_text("⏳ Processing download from inline search...")
+                status_msg = await update.message.reply_text("Processing download from inline search...")
                 if is_video:
                     await execute_video_download(update.effective_chat.id, url, context, status_msg)
                 else:
@@ -420,7 +448,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     user_active_tasks[user_id] -= 1
             return
 
-    # --- ORIGINAL START MESSAGE ---
     user_first_name = update.effective_user.first_name or "there"
     welcome_text = (
         f"<b>Welcome to Linko, {user_first_name}!</b>\n\n"
@@ -535,14 +562,14 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def clip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("✂️ *Smart Clipper*\nUsage: `/clip [link] [start]-[end]`\nExample: `/clip https://youtu.be/xyz 01:15-01:45`", parse_mode="Markdown")
+        await update.message.reply_text("Smart Clipper\nUsage: `/clip [link] [start]-[end]`\nExample: `/clip https://youtu.be/xyz 01:15-01:45`", parse_mode="Markdown")
         return
         
     url = args[0]
     timestamps = "".join(args[1:])
     
     if "-" not in timestamps:
-        await update.message.reply_text("❌ Please use the format start-end (e.g., 01:15-01:45).")
+        await update.message.reply_text("Error: Please use the format start-end (e.g., 01:15-01:45).")
         return
         
     try:
@@ -550,12 +577,12 @@ async def clip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         start_sec = parse_time_to_seconds(start_str)
         end_sec = parse_time_to_seconds(end_str)
     except Exception:
-        await update.message.reply_text("❌ Invalid time format. Use MM:SS.")
+        await update.message.reply_text("Error: Invalid time format. Use MM:SS.")
         return
 
     is_safe, error_reason = is_safe_public_url(url)
     if not is_safe:
-        await update.message.reply_text(f"❌ {error_reason}")
+        await update.message.reply_text(f"Error: {error_reason}")
         return
 
     req_id = str(uuid.uuid4())[:8]
@@ -565,7 +592,7 @@ async def clip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         [InlineKeyboardButton("Clip Audio (MP3)", callback_data=f"dlc|{req_id}|high")],
         [InlineKeyboardButton("Clip Video (MP4)", callback_data=f"dlvc|{req_id}")]
     ]
-    await update.message.reply_text(f"✂️ Clipping from {start_str} to {end_str}.\nChoose format:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(f"Clipping from {start_str} to {end_str}.\nChoose format:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("Getting the top trending songs...")
@@ -648,11 +675,10 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             GLOBAL_SESSION[req_id] = {"url": url}
             title = entry.get("title", "Unknown")[:50]
             
-            # Use Deep Links instead of Callbacks
             keyboard = [
                 [
-                    InlineKeyboardButton("🎵 Download MP3", url=f"https://t.me/{bot_username}?start=dli_high_{req_id}"),
-                    InlineKeyboardButton("🎬 Download MP4", url=f"https://t.me/{bot_username}?start=dlvi_{req_id}")
+                    InlineKeyboardButton("Download MP3", url=f"https://t.me/{bot_username}?start=dli_high_{req_id}"),
+                    InlineKeyboardButton("Download MP4", url=f"https://t.me/{bot_username}?start=dlvi_{req_id}")
                 ]
             ]
             
@@ -662,7 +688,7 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     title=title,
                     description=f"by {entry.get('uploader', 'Unknown')}",
                     input_message_content=InputTextMessageContent(
-                        f"🎵 <b>{title}</b>\n🔗 {url}", 
+                        f"<b>{title}</b>\n🔗 {url}", 
                         parse_mode="HTML", 
                         disable_web_page_preview=True
                     ),
@@ -723,14 +749,14 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     
     if user_active_tasks.get(user_id, 0) > 0:
-        await update.message.reply_text("⚠️ Please wait! Your previous file is still processing.")
+        await update.message.reply_text("Please wait. Your previous file is still processing.")
         return
 
     now = time.time()
     last_req = user_last_request.get(user_id, 0)
     if now - last_req < USER_COOLDOWN_SECONDS:
         remaining = int(USER_COOLDOWN_SECONDS - (now - last_req))
-        await update.message.reply_text(f"⚠️ Please wait {remaining} seconds before sending another link.")
+        await update.message.reply_text(f"Please wait {remaining} seconds before sending another link.")
         return
     
     message_text = update.message.text.strip()
@@ -744,7 +770,7 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     is_safe, error_reason = is_safe_public_url(message_text)
     if not is_safe:
-        await update.message.reply_text(f"❌ {error_reason}")
+        await update.message.reply_text(f"Error: {error_reason}")
         return
         
     request_id = str(uuid.uuid4())[:8]
@@ -772,60 +798,101 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Link verified! Choose your download format:", reply_markup=reply_markup)
 
 async def execute_video_download(chat_id, url, context, status_msg=None, start_sec=None, end_sec=None):
+    global current_in_queue
+
     async def update_status(text):
         if status_msg:
             try:
-                await context.bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id)
+                await context.bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id, parse_mode="HTML")
             except Exception:
                 pass
 
-    if start_sec is not None:
-        await update_status("Clipping video directly from the server...")
-    else:
-        await update_status("Downloading video without watermark...")
-        
-    job_id = str(uuid.uuid4())
-    job_dir = os.path.join(DOWNLOAD_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    output_template = os.path.join(job_dir, "video_track.mp4")
-    
-    try:
-        async with download_semaphore:
-            metadata = await asyncio.to_thread(BlockingDownloadVideo, url, output_template, start_sec, end_sec)
-            
-        mp4_path = os.path.join(job_dir, "video_track.mp4")
-        if not os.path.exists(mp4_path):
-            raise ValueError("The video file could not be generated.")
-            
-        file_size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
-        if file_size_mb > 49.5:
-            await update_status(f"⚠️ This video is too large ({file_size_mb:.2f} MB). Telegram limits bots to 50 MB.")
+    async with queue_counter_lock:
+        if current_in_queue >= MAX_QUEUE_CAPACITY:
+            await update_status("<b>Traffic Alert:</b> Over 100 requests in line right now. Please try again in 1-2 minutes.")
             return
-            
-        await update_status("Uploading video to Telegram...")
-        video_buttons = [
-            [
-                InlineKeyboardButton("☕ Buy Me a Coffee", callback_data="donate"),
-                InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
-            ]
-        ]
-        with open(mp4_path, "rb") as vf:
-            await context.bot.send_video(
-                chat_id=chat_id,
-                video=vf,
-                caption=f"{metadata.get('title', 'Video')}\nSize: {file_size_mb:.2f} MB",
-                supports_streaming=True,
-                reply_markup=InlineKeyboardMarkup(video_buttons)
+        current_in_queue += 1
+        pos = current_in_queue
+
+    in_queue = True
+    try:
+        if download_semaphore.locked():
+            await update_status(
+                f"<b>[High Traffic]</b> Linko is currently busy with multiple downloads.\n\n"
+                f"You are <b>#{pos}</b> in line. Please wait, your video will be processed automatically."
             )
-        if status_msg:
-            await context.bot.delete_message(chat_id, status_msg.message_id)
+
+        async with download_semaphore:
+            async with queue_counter_lock:
+                current_in_queue -= 1
+                in_queue = False
+
+            if start_sec is not None:
+                await update_status("Clipping video directly from the server...")
+            else:
+                await update_status("Processing your request. Downloading video...")
+                
+            job_id = str(uuid.uuid4())
+            job_dir = os.path.join(DOWNLOAD_DIR, job_id)
+            os.makedirs(job_dir, exist_ok=True)
+            output_template = os.path.join(job_dir, "video_track.mp4")
             
-    except Exception as e:
-        await update_status(f"❌ Error: {explain_download_error(e)}")
+            try:
+                metadata = await asyncio.to_thread(BlockingDownloadVideo, url, output_template, start_sec, end_sec)
+                
+                await update_status("Uploading video to Telegram...")
+                video_buttons = [
+                    [
+                        InlineKeyboardButton("☕ Buy Me a Coffee", callback_data="donate"),
+                        InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
+                    ]
+                ]
+
+                # Check if the URL bypass was successful
+                if metadata.get("direct_url"):
+                    await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=metadata["direct_url"],
+                        caption=f"{metadata.get('title', 'Video')}\nSize: < 20 MB (Direct URL)",
+                        supports_streaming=True,
+                        reply_markup=InlineKeyboardMarkup(video_buttons)
+                    )
+                else:
+                    mp4_path = os.path.join(job_dir, "video_track.mp4")
+                    if not os.path.exists(mp4_path):
+                        raise ValueError("The video file could not be generated.")
+                        
+                    file_size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
+                    if file_size_mb > 49.5:
+                        await update_status(f"This video is too large ({file_size_mb:.2f} MB). Telegram limits bots to 50 MB.")
+                        return
+                        
+                    with open(mp4_path, "rb") as vf:
+                        await context.bot.send_video(
+                            chat_id=chat_id,
+                            video=vf,
+                            caption=f"{metadata.get('title', 'Video')}\nSize: {file_size_mb:.2f} MB",
+                            supports_streaming=True,
+                            reply_markup=InlineKeyboardMarkup(video_buttons)
+                        )
+
+                if status_msg:
+                    await context.bot.delete_message(chat_id, status_msg.message_id)
+                    
+            except Exception as e:
+                await update_status(f"Error: {explain_download_error(e)}")
+            finally:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                gc.collect()
+
     finally:
-        shutil.rmtree(job_dir, ignore_errors=True)
+        if in_queue:
+            async with queue_counter_lock:
+                current_in_queue -= 1
+        gc.collect()
 
 async def execute_download(chat_id, url, preset_key, context, status_msg=None, status_prefix="", start_sec=None, end_sec=None):
+    global current_in_queue
     preset = QUALITY_PRESETS.get(preset_key, QUALITY_PRESETS["medium"])
     bitrate = preset["bitrate"]
     is_voice = preset["type"] == "voice"
@@ -833,106 +900,142 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
     async def update_status(text):
         if status_msg:
             try: 
-                await context.bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id)
+                await context.bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id, parse_mode="HTML")
             except Exception: 
                 pass
 
-    if start_sec is not None:
-        await update_status(f"{status_prefix}Clipping {preset['label']}...\nPlease wait, this might take a minute.")
-    else:
-        await update_status(f"{status_prefix}Downloading ({preset['label']})...\nPlease wait, this might take a minute or two.")
-    
-    job_id = str(uuid.uuid4())
-    job_dir = os.path.join(DOWNLOAD_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    output_template = os.path.join(job_dir, "audio_track.%(ext)s")
-    
-    try:
-        async with download_semaphore:
-            metadata = await asyncio.to_thread(BlockingDownloadAudio, url, bitrate, output_template, is_voice, start_sec, end_sec)
-            
-        target_ext = ".ogg" if is_voice else ".mp3"
-        files = [os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(target_ext)]
-        if not files:
-            await update_status(f"{status_prefix}❌ Error: Failed to extract the audio file.")
+    async with queue_counter_lock:
+        if current_in_queue >= MAX_QUEUE_CAPACITY:
+            await update_status(f"{status_prefix}<b>Traffic Alert:</b> Over 100 requests in line right now. Please try again in 1-2 minutes.")
             return
-            
-        media_path = files[0]
-        file_size_mb = os.path.getsize(media_path) / (1024 * 1024)
-        
-        if file_size_mb > 49.5:
-            await update_status(f"{status_prefix}⚠️ This file is too large ({file_size_mb:.2f} MB). Telegram limits bots to 50 MB.")
-            return
-            
-        await update_status(f"{status_prefix}Uploading audio to Telegram...")
-        
-        raw_title = metadata.get('title', 'Audio Track')
-        uploader = metadata.get('uploader', 'Linko').replace(' - Topic', '')
-        clean_title = re.sub(r'(?i)(\(official.*?\)|\[official.*?\]|\(music video.*?\)|\(lyric.*?\)|\[lyric.*?\]|\(audio.*?\)|\[audio.*?\]|\(live.*?\))', '', raw_title).strip()
-        
-        if uploader.lower() not in clean_title.lower():
-            search_str = f"{clean_title} {uploader}"
-        else:
-            search_str = clean_title
-            
-        search_str = search_str.strip()
-        search_bytes = search_str.encode('utf-8')
-        if len(search_bytes) > 50:
-            search_str = search_bytes[:50].decode('utf-8', errors='ignore')
-            
-        action_buttons = []
-        if search_str:
-            action_buttons.append([InlineKeyboardButton("📝 View Lyrics", callback_data=f"lyrics|{search_str}")])
-        action_buttons.append([
-            InlineKeyboardButton("☕ Buy Me a Coffee", callback_data="donate"),
-            InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
-        ])
-        btn = InlineKeyboardMarkup(action_buttons)
-        
-        if is_voice:
-            with open(media_path, "rb") as vf:
-                await context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=vf,
-                    caption=f"{clean_title}\nSize: {file_size_mb:.2f} MB",
-                    reply_markup=btn
-                )
-        else:
-            thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.jpg')), None)
-            if thumb_path:
-                small_thumb = os.path.join(job_dir, "cover_320.jpg")
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", thumb_path, "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-q:v", "5", small_thumb], 
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                if os.path.exists(small_thumb):
-                    thumb_path = small_thumb
+        current_in_queue += 1
+        pos = current_in_queue
 
-            with open(media_path, "rb") as audio_file:
-                thumb_file = open(thumb_path, "rb") if thumb_path else None
-                try:
+    in_queue = True
+    try:
+        if download_semaphore.locked():
+            await update_status(
+                f"{status_prefix}<b>[High Traffic]</b> Linko is currently busy with multiple downloads.\n\n"
+                f"You are <b>#{pos}</b> in line. Please wait, your file will be processed automatically."
+            )
+
+        async with download_semaphore:
+            async with queue_counter_lock:
+                current_in_queue -= 1
+                in_queue = False
+
+            if start_sec is not None:
+                await update_status(f"{status_prefix}Clipping ({preset['label']})... Please wait a moment.")
+            else:
+                await update_status(f"{status_prefix}Processing your request. Downloading ({preset['label']})...")
+            
+            job_id = str(uuid.uuid4())
+            job_dir = os.path.join(DOWNLOAD_DIR, job_id)
+            os.makedirs(job_dir, exist_ok=True)
+            output_template = os.path.join(job_dir, "audio_track.%(ext)s")
+            
+            try:
+                metadata = await asyncio.to_thread(BlockingDownloadAudio, url, bitrate, output_template, is_voice, start_sec, end_sec)
+                await update_status(f"{status_prefix}Uploading audio to Telegram...")
+                
+                raw_title = metadata.get('title', 'Audio Track')
+                uploader = metadata.get('uploader', 'Linko').replace(' - Topic', '')
+                clean_title = re.sub(r'(?i)(\(official.*?\)|\[official.*?\]|\(music video.*?\)|\(lyric.*?\)|\[lyric.*?\]|\(audio.*?\)|\[audio.*?\]|\(live.*?\))', '', raw_title).strip()
+                
+                if uploader.lower() not in clean_title.lower():
+                    search_str = f"{clean_title} {uploader}"
+                else:
+                    search_str = clean_title
+                    
+                search_str = search_str.strip()
+                search_bytes = search_str.encode('utf-8')
+                if len(search_bytes) > 50:
+                    search_str = search_bytes[:50].decode('utf-8', errors='ignore')
+                    
+                action_buttons = []
+                if search_str:
+                    action_buttons.append([InlineKeyboardButton("📝 View Lyrics", callback_data=f"lyrics|{search_str}")])
+                action_buttons.append([
+                    InlineKeyboardButton("☕ Buy Me a Coffee", callback_data="donate"),
+                    InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
+                ])
+                btn = InlineKeyboardMarkup(action_buttons)
+                
+                # Check if the direct URL bypass was successful
+                if metadata.get("direct_url"):
                     await context.bot.send_audio(
                         chat_id=chat_id,
-                        audio=audio_file,
+                        audio=metadata["direct_url"],
                         title=metadata.get("title", "Audio").replace("_", " "),
                         performer=metadata.get("uploader", "Linko").replace("_", " "),
-                        thumbnail=thumb_file,
-                        caption=f"{bitrate} kbps | {file_size_mb:.2f} MB",
+                        caption=f"{bitrate} kbps | < 20 MB (Direct URL)",
                         reply_markup=btn
                     )
-                finally:
-                    if thumb_file:
-                        thumb_file.close()
-            
-        if status_msg: 
-            await context.bot.delete_message(chat_id, status_msg.message_id)
-            
-    except ValueError as ve:
-        await update_status(f"{status_prefix}⚠️ {ve}")
-    except Exception as e:
-        await update_status(f"{status_prefix}❌ Error: {explain_download_error(e)}")
+                else:
+                    target_ext = ".ogg" if is_voice else ".mp3"
+                    files = [os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(target_ext)]
+                    if not files:
+                        await update_status(f"{status_prefix}Error: Failed to extract the audio file.")
+                        return
+                        
+                    media_path = files[0]
+                    file_size_mb = os.path.getsize(media_path) / (1024 * 1024)
+                    
+                    if file_size_mb > 49.5:
+                        await update_status(f"{status_prefix}This file is too large ({file_size_mb:.2f} MB). Telegram limits bots to 50 MB.")
+                        return
+                        
+                    if is_voice:
+                        with open(media_path, "rb") as vf:
+                            await context.bot.send_voice(
+                                chat_id=chat_id,
+                                voice=vf,
+                                caption=f"{clean_title}\nSize: {file_size_mb:.2f} MB",
+                                reply_markup=btn
+                            )
+                    else:
+                        thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.jpg')), None)
+                        if thumb_path:
+                            small_thumb = os.path.join(job_dir, "cover_320.jpg")
+                            subprocess.run(
+                                ["ffmpeg", "-y", "-i", thumb_path, "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-q:v", "5", small_thumb], 
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                            )
+                            if os.path.exists(small_thumb):
+                                thumb_path = small_thumb
+
+                        with open(media_path, "rb") as audio_file:
+                            thumb_file = open(thumb_path, "rb") if thumb_path else None
+                            try:
+                                await context.bot.send_audio(
+                                    chat_id=chat_id,
+                                    audio=audio_file,
+                                    title=metadata.get("title", "Audio").replace("_", " "),
+                                    performer=metadata.get("uploader", "Linko").replace("_", " "),
+                                    thumbnail=thumb_file,
+                                    caption=f"{bitrate} kbps | {file_size_mb:.2f} MB",
+                                    reply_markup=btn
+                                )
+                            finally:
+                                if thumb_file:
+                                    thumb_file.close()
+                        
+                if status_msg: 
+                    await context.bot.delete_message(chat_id, status_msg.message_id)
+                    
+            except ValueError as ve:
+                await update_status(f"{status_prefix}Error: {ve}")
+            except Exception as e:
+                await update_status(f"{status_prefix}Error: {explain_download_error(e)}")
+            finally:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                gc.collect()
+
     finally:
-        shutil.rmtree(job_dir, ignore_errors=True)
+        if in_queue:
+            async with queue_counter_lock:
+                current_in_queue -= 1
+        gc.collect()
 
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -977,10 +1080,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     parts = data.split("|")
     prefix = parts[0]
 
-    # Handle all Video Downloads (Regular, Inline, and Clips)
+    # Handle Video Downloads
     if prefix in ("dlv", "dlvi", "dlvc"):
         if user_active_tasks.get(user_id, 0) > 0:
-            await query.edit_message_text("⚠️ Please wait! Your previous file is still processing.")
+            await query.edit_message_text("Please wait. Your previous file is still processing.")
             return
 
         req_id = parts[1]
@@ -1012,10 +1115,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 user_active_tasks[user_id] -= 1
         return
 
-    # Handle all Audio Downloads (Regular, Playlist, Inline, and Clips)
+    # Handle Audio Downloads
     if prefix in ("dl", "dlpl", "dli", "dlc"):
         if user_active_tasks.get(user_id, 0) > 0:
-            await query.edit_message_text("⚠️ Please wait! Your previous file is still processing.")
+            await query.edit_message_text("Please wait. Your previous file is still processing.")
             return
 
         req_id = parts[1]
@@ -1062,7 +1165,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 entries = list(entries)[:MAX_PLAYLIST_ITEMS]
                 
                 await query.edit_message_text(
-                    f"Playlist queued: {len(entries)} tracks. Downloading one by one to keep the server stable..."
+                    f"Playlist queued: {len(entries)} tracks. Downloading sequentially."
                 )
                 
                 for i, entry in enumerate(entries, 1):
@@ -1080,6 +1183,8 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         status_msg, 
                         f"[Track {i}/{len(entries)}] "
                     )
+                    gc.collect()
+                    await asyncio.sleep(2.0)
         finally:
             if user_active_tasks[user_id] > 0:
                 user_active_tasks[user_id] -= 1
