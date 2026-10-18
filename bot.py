@@ -39,7 +39,7 @@ DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 FEEDBACK_URL = os.environ.get("FEEDBACK_URL", "https://forms.gle/4u6R2iG8vFj5A7Q77")
-KBZPAY_QR_PATH = os.environ.get("KBZPAY_QR_PATH", "kbzpay_qr.png")
+KBZPAY_QR_URL = os.environ.get("KBZPAY_QR_URL", "")
 
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 4))
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -409,7 +409,9 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     about_text = (
         "About Linko\n\n"
         "Linko is a free bot designed to download public media and music easily.\n\n"
-        "Built with Python, yt-dlp, FFmpeg, and ShazamIO."
+        "Built with Python, yt-dlp, FFmpeg, and ShazamIO.\n\n"
+        "👨‍💻 Developed by Htet Zaw Paing\n"
+        "🏢 A project by MyanCode"
     )
     await update.message.reply_text(about_text)
 
@@ -429,17 +431,15 @@ async def send_donation_info(chat_id, context: ContextTypes.DEFAULT_TYPE) -> Non
         "and buy me a coffee by scanning the KBZPay QR code below.\n\n"
         "Any amount is genuinely appreciated and helps keep the bot fast, stable, and running 24/7!"
     )
-    qr_file = None
-    for candidate in [KBZPAY_QR_PATH, "kbzpay_qr.png", "kbzpay_qr.jpg", "kbzpay.png", "kbzpay.jpg"]:
-        if os.path.exists(candidate):
-            qr_file = candidate
-            break
-
-    if qr_file:
-        with open(qr_file, "rb") as photo:
-            await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=donate_caption)
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=donate_caption)
+    
+    if KBZPAY_QR_URL:
+        try:
+            await context.bot.send_photo(chat_id=chat_id, photo=KBZPAY_QR_URL, caption=donate_caption)
+            return
+        except Exception as e:
+            logger.error(f"Failed to send QR image from URL: {e}")
+            
+    await context.bot.send_message(chat_id=chat_id, text=donate_caption)
 
 async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_donation_info(update.effective_chat.id, context)
