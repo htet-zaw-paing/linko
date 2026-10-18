@@ -384,6 +384,43 @@ async def post_init(application) -> None:
     await application.bot.set_my_commands(commands)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    user_id = update.effective_user.id
+    
+    # --- NEW: Intercept Deep Links from Inline Search ---
+    if args:
+        payload = args[0]
+        if payload.startswith("dli_") or payload.startswith("dlvi_"):
+            if user_active_tasks.get(user_id, 0) > 0:
+                await update.message.reply_text("⚠️ Please wait! Your previous file is still processing.")
+                return
+            
+            parts = payload.split("_")
+            is_video = payload.startswith("dlvi_")
+            req_id = parts[1] if is_video else parts[2]
+            quality_key = "high" if is_video else parts[1]
+
+            session = GLOBAL_SESSION.pop(req_id, None)
+            if not session:
+                await update.message.reply_text("❌ This link has expired. Please search again.")
+                return
+            
+            url = session.get("url")
+            user_last_request[user_id] = time.time()
+            user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
+            
+            try:
+                status_msg = await update.message.reply_text("⏳ Processing download from inline search...")
+                if is_video:
+                    await execute_video_download(update.effective_chat.id, url, context, status_msg)
+                else:
+                    await execute_download(update.effective_chat.id, url, quality_key, context, status_msg, "")
+            finally:
+                if user_active_tasks[user_id] > 0:
+                    user_active_tasks[user_id] -= 1
+            return
+
+    # --- ORIGINAL START MESSAGE ---
     user_first_name = update.effective_user.first_name or "there"
     welcome_text = (
         f"<b>Welcome to Linko, {user_first_name}!</b>\n\n"
@@ -601,6 +638,8 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         info = await asyncio.to_thread(do_search)
         results = []
+        bot_username = context.bot.username
+        
         for entry in info.get("entries", []):
             url = entry.get("url")
             if not url: continue
@@ -609,9 +648,12 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             GLOBAL_SESSION[req_id] = {"url": url}
             title = entry.get("title", "Unknown")[:50]
             
+            # Use Deep Links instead of Callbacks
             keyboard = [
-                [InlineKeyboardButton("Audio (MP3)", callback_data=f"dli|{req_id}|high"),
-                 InlineKeyboardButton("Video (MP4)", callback_data=f"dlvi|{req_id}")]
+                [
+                    InlineKeyboardButton("🎵 Download MP3", url=f"https://t.me/{bot_username}?start=dli_high_{req_id}"),
+                    InlineKeyboardButton("🎬 Download MP4", url=f"https://t.me/{bot_username}?start=dlvi_{req_id}")
+                ]
             ]
             
             results.append(
