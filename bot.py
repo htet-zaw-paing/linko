@@ -357,17 +357,26 @@ async def post_init(application) -> None:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_first_name = update.effective_user.first_name or "there"
     welcome_text = (
-        f"Welcome to Linko, {user_first_name}!\n\n"
-        "Here is what I can do:\n"
-        "1. Download Media: Send me any public video or audio link.\n"
-        "2. Search Music: Type /search [song name] to find tracks.\n"
-        "3. Top Hits: Type /trending to see popular songs.\n"
-        "4. Identify Music: Forward a voice note or audio clip to find out its name.\n\n"
-        "Read the English Guide: https://telegra.ph/Linko---User-Guide-10-17\n"
-        "မြန်မာလမ်းညွှန် ဖတ်ရန်: https://telegra.ph/Linko---User-Guide-MM-10-17\n\n"
-        "By using Linko, you agree to our /terms."
+        f"<b>Welcome to Linko, {user_first_name}!</b>\n\n"
+        "Here is what I can do:\n\n"
+        "<b>1. Download Media</b>\n"
+        "Send me any public video or audio link.\n\n"
+        "<b>2. Search Music</b>\n"
+        "Type /search [song name] to find tracks.\n\n"
+        "<b>3. Top Hits</b>\n"
+        "Type /trending to see popular songs.\n\n"
+        "<b>4. Identify Music</b>\n"
+        "Forward a voice note or audio clip to find out its name.\n\n"
+        "<b>Guides:</b>\n"
+        "• <a href='https://telegra.ph/Linko---User-Guide-10-17'>Read the English Guide</a>\n"
+        "• <a href='https://telegra.ph/Linko---User-Guide-MM-10-17'>မြန်မာလမ်းညွှန် ဖတ်ရန်</a>\n\n"
+        "<i>By using Linko, you agree to our /terms.</i>"
     )
-    await update.message.reply_text(welcome_text)
+    await update.message.reply_text(
+        welcome_text, 
+        parse_mode="HTML", 
+        disable_web_page_preview=True
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
