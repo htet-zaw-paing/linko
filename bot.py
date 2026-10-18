@@ -51,7 +51,6 @@ user_active_tasks: dict[int, int] = {}
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 MAX_PLAYLIST_ITEMS = 10
 
-# Dynamic Queue Manager
 MAX_QUEUE_CAPACITY = 100
 current_in_queue = 0
 queue_counter_lock = asyncio.Lock()
@@ -183,8 +182,6 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
                     dl_url = resp.json().get("url")
                     title = resp.json().get("filename", "Audio").replace("_", " ")
                     if dl_url:
-                        # Direct URL Bypass Check for Audio < 20MB (Telegram limit)
-                        # Voice messages must be transcoded locally to OGG, so bypass only applies to MP3
                         if not is_voice:
                             try:
                                 head_resp = requests.head(dl_url, timeout=10)
@@ -200,7 +197,6 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
                             except Exception:
                                 pass
 
-                        # Fallback to local download if bypass fails or voice mode is active
                         raw_file = os.path.join(job_dir, "raw_audio_temp")
                         with requests.get(dl_url, stream=True, timeout=25) as r:
                             r.raise_for_status()
@@ -334,7 +330,6 @@ def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None,
                     dl_url = resp.json().get("url")
                     title = resp.json().get("filename", "Video").replace("_", " ")
                     
-                    # Direct URL Bypass Check for Video < 20MB (Telegram limit)
                     try:
                         head_resp = requests.head(dl_url, timeout=10)
                         size = int(head_resp.headers.get("Content-Length", 0))
@@ -696,8 +691,8 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 )
             )
         await update.inline_query.answer(results, cache_time=10)
-    except Exception as e:
-        logger.error(f"Inline search error: {e}")
+    except Exception:
+        pass
 
 async def handle_audio_recognition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("Audio received. Identifying the song...")
@@ -848,14 +843,16 @@ async def execute_video_download(chat_id, url, context, status_msg=None, start_s
                     ]
                 ]
 
-                # Check if the URL bypass was successful
                 if metadata.get("direct_url"):
                     await context.bot.send_video(
                         chat_id=chat_id,
                         video=metadata["direct_url"],
                         caption=f"{metadata.get('title', 'Video')}\nSize: < 20 MB (Direct URL)",
                         supports_streaming=True,
-                        reply_markup=InlineKeyboardMarkup(video_buttons)
+                        reply_markup=InlineKeyboardMarkup(video_buttons),
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=60
                     )
                 else:
                     mp4_path = os.path.join(job_dir, "video_track.mp4")
@@ -873,11 +870,17 @@ async def execute_video_download(chat_id, url, context, status_msg=None, start_s
                             video=vf,
                             caption=f"{metadata.get('title', 'Video')}\nSize: {file_size_mb:.2f} MB",
                             supports_streaming=True,
-                            reply_markup=InlineKeyboardMarkup(video_buttons)
+                            reply_markup=InlineKeyboardMarkup(video_buttons),
+                            read_timeout=120,
+                            write_timeout=120,
+                            connect_timeout=60
                         )
 
                 if status_msg:
-                    await context.bot.delete_message(chat_id, status_msg.message_id)
+                    try:
+                        await context.bot.delete_message(chat_id, status_msg.message_id)
+                    except Exception:
+                        pass
                     
             except Exception as e:
                 await update_status(f"Error: {explain_download_error(e)}")
@@ -961,7 +964,6 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
                 ])
                 btn = InlineKeyboardMarkup(action_buttons)
                 
-                # Check if the direct URL bypass was successful
                 if metadata.get("direct_url"):
                     await context.bot.send_audio(
                         chat_id=chat_id,
@@ -969,7 +971,10 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
                         title=metadata.get("title", "Audio").replace("_", " "),
                         performer=metadata.get("uploader", "Linko").replace("_", " "),
                         caption=f"{bitrate} kbps | < 20 MB (Direct URL)",
-                        reply_markup=btn
+                        reply_markup=btn,
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=60
                     )
                 else:
                     target_ext = ".ogg" if is_voice else ".mp3"
@@ -991,7 +996,10 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
                                 chat_id=chat_id,
                                 voice=vf,
                                 caption=f"{clean_title}\nSize: {file_size_mb:.2f} MB",
-                                reply_markup=btn
+                                reply_markup=btn,
+                                read_timeout=120,
+                                write_timeout=120,
+                                connect_timeout=60
                             )
                     else:
                         thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.jpg')), None)
@@ -1014,14 +1022,20 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
                                     performer=metadata.get("uploader", "Linko").replace("_", " "),
                                     thumbnail=thumb_file,
                                     caption=f"{bitrate} kbps | {file_size_mb:.2f} MB",
-                                    reply_markup=btn
+                                    reply_markup=btn,
+                                    read_timeout=120,
+                                    write_timeout=120,
+                                    connect_timeout=60
                                 )
                             finally:
                                 if thumb_file:
                                     thumb_file.close()
                         
                 if status_msg: 
-                    await context.bot.delete_message(chat_id, status_msg.message_id)
+                    try:
+                        await context.bot.delete_message(chat_id, status_msg.message_id)
+                    except Exception:
+                        pass
                     
             except ValueError as ve:
                 await update_status(f"{status_prefix}Error: {ve}")
@@ -1080,7 +1094,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     parts = data.split("|")
     prefix = parts[0]
 
-    # Handle Video Downloads
     if prefix in ("dlv", "dlvi", "dlvc"):
         if user_active_tasks.get(user_id, 0) > 0:
             await query.edit_message_text("Please wait. Your previous file is still processing.")
@@ -1115,7 +1128,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 user_active_tasks[user_id] -= 1
         return
 
-    # Handle Audio Downloads
     if prefix in ("dl", "dlpl", "dli", "dlc"):
         if user_active_tasks.get(user_id, 0) > 0:
             await query.edit_message_text("Please wait. Your previous file is still processing.")
