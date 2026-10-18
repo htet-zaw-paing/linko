@@ -38,6 +38,9 @@ PORT = int(os.environ.get("PORT", 8080))
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+FEEDBACK_URL = os.environ.get("FEEDBACK_URL", "https://forms.gle/4u6R2iG8vFj5A7Q77")
+KBZPAY_QR_PATH = os.environ.get("KBZPAY_QR_PATH", "kbzpay_qr.png")
+
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", 4))
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 USER_COOLDOWN_SECONDS = int(os.environ.get("USER_COOLDOWN_SECONDS", 15))
@@ -47,10 +50,10 @@ MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 MAX_PLAYLIST_ITEMS = 10
 
 QUALITY_PRESETS = {
-    "standard": {"label": "Standard (128 kbps)", "bitrate": "128", "type": "audio"},
-    "medium": {"label": "Medium (192 kbps)", "bitrate": "192", "type": "audio"},
-    "high": {"label": "High (320 kbps)", "bitrate": "320", "type": "audio"},
-    "voice": {"label": "Voice Note (OGG)", "bitrate": "64", "type": "voice"}
+    "standard": {"label": "Standard Audio (MP3)", "bitrate": "128", "type": "audio"},
+    "medium": {"label": "Medium Audio (MP3)", "bitrate": "192", "type": "audio"},
+    "high": {"label": "High Audio (MP3)", "bitrate": "320", "type": "audio"},
+    "voice": {"label": "Voice Message (OGG)", "bitrate": "64", "type": "voice"}
 }
 
 COOKIES_B64 = os.environ.get("COOKIES_B64", "").strip()
@@ -304,7 +307,19 @@ def BlockingDownloadVideo(url: str, output_template: str) -> dict:
         "quiet": True,
         "no_warnings": True,
         "max_filesize": 50 * 1024 * 1024,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "android_vr", "tv", "mweb", "web"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        },
     }
+    
+    if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
+        ydl_opts["cookiefile"] = COOKIES_FILE_PATH
+        
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return {"title": info.get("title", "Video"), "uploader": info.get("uploader", "Linko")}
@@ -332,6 +347,8 @@ async def post_init(application) -> None:
         BotCommand("trending", "See top trending songs"),
         BotCommand("help", "Learn how to use the bot"),
         BotCommand("quality", "See audio quality options"),
+        BotCommand("donate", "Support Linko (Buy me a coffee)"),
+        BotCommand("feedback", "Send suggestions and feedback"),
         BotCommand("terms", "Rules and privacy terms"),
         BotCommand("about", "About Linko"),
     ]
@@ -360,9 +377,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- Send a voice note or audio file to identify the song.\n"
         "- Type /search [song name] or /trending.\n\n"
         "Download Options:\n"
-        "- MP3 Audio (128, 192, or 320 kbps)\n"
-        "- Voice Note (OGG format)\n"
-        "- MP4 Video (Watermark-free for short videos)\n\n"
+        "- Standard Audio (MP3)\n"
+        "- Medium Audio (MP3)\n"
+        "- High Audio (MP3)\n"
+        "- Voice Message (OGG)\n"
+        "- Standard Video (MP4)\n\n"
         "Read the English Guide: https://telegra.ph/Linko---User-Guide-10-17\n"
         "မြန်မာလမ်းညွှန် ဖတ်ရန်: https://telegra.ph/Linko---User-Guide-MM-10-17\n\n"
         "Limits: Max 30 minutes length, max 50 MB file size."
@@ -372,16 +391,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     quality_text = (
         "Audio Quality Options\n\n"
-        "1. Standard (128 kbps)\n"
+        "1. Standard Audio (MP3 - 128 kbps)\n"
         "   - Best for fast downloads and saving data.\n"
         "   - Size: ~1.0 MB per minute.\n\n"
-        "2. Medium (192 kbps)\n"
+        "2. Medium Audio (MP3 - 192 kbps)\n"
         "   - Great balance of quality and file size.\n"
         "   - Size: ~1.4 MB per minute.\n\n"
-        "3. High (320 kbps)\n"
+        "3. High Audio (MP3 - 320 kbps)\n"
         "   - Best audio quality for music listening.\n"
         "   - Size: ~2.4 MB per minute.\n\n"
-        "4. Voice Note\n"
+        "4. Voice Message (OGG)\n"
         "   - Sends the audio as a playable Telegram voice message."
     )
     await update.message.reply_text(quality_text)
@@ -402,6 +421,36 @@ async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "3. Privacy: All downloaded files are completely deleted from our servers immediately after they are sent to you."
     )
     await update.message.reply_text(terms_text)
+
+async def send_donation_info(chat_id, context: ContextTypes.DEFAULT_TYPE) -> None:
+    donate_caption = (
+        "Thank you so much for using Linko!\n\n"
+        "If Linko has been helpful and made your downloads convenient, you can support "
+        "and buy me a coffee by scanning the KBZPay QR code below.\n\n"
+        "Any amount is genuinely appreciated and helps keep the bot fast, stable, and running 24/7!"
+    )
+    qr_file = None
+    for candidate in [KBZPAY_QR_PATH, "kbzpay_qr.png", "kbzpay_qr.jpg", "kbzpay.png", "kbzpay.jpg"]:
+        if os.path.exists(candidate):
+            qr_file = candidate
+            break
+
+    if qr_file:
+        with open(qr_file, "rb") as photo:
+            await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=donate_caption)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=donate_caption)
+
+async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_donation_info(update.effective_chat.id, context)
+
+async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [[InlineKeyboardButton("Open Feedback Form", url=FEEDBACK_URL)]]
+    await update.message.reply_text(
+        "We would love to hear your thoughts, suggestions, or bug reports to improve Linko!\n\n"
+        "Tap the button below to share your feedback:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("Getting the top trending songs...")
@@ -543,7 +592,7 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     keyboard = []
     if any(d in message_text.lower() for d in ["tiktok.com", "instagram.com/reel", "youtube.com/shorts", "youtu.be"]):
-        keyboard.append([InlineKeyboardButton("Video (MP4)", callback_data=f"dlv|{request_id}")])
+        keyboard.append([InlineKeyboardButton("Standard Video (MP4)", callback_data=f"dlv|{request_id}")])
         
     if "list=" in message_text or "/playlist" in message_text or "/album/" in message_text:
         keyboard.append([InlineKeyboardButton("Single Track", callback_data=f"askq|{request_id}")])
@@ -551,10 +600,10 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel|000")])
         await update.message.reply_text("Playlist found! What would you like to download?", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        keyboard.append([InlineKeyboardButton("Standard (128 kbps)", callback_data=f"dl|{request_id}|standard")])
-        keyboard.append([InlineKeyboardButton("Medium (192 kbps)", callback_data=f"dl|{request_id}|medium")])
-        keyboard.append([InlineKeyboardButton("High (320 kbps)", callback_data=f"dl|{request_id}|high")])
-        keyboard.append([InlineKeyboardButton("Voice Note (OGG)", callback_data=f"dl|{request_id}|voice")])
+        keyboard.append([InlineKeyboardButton("Standard Audio (MP3)", callback_data=f"dl|{request_id}|standard")])
+        keyboard.append([InlineKeyboardButton("Medium Audio (MP3)", callback_data=f"dl|{request_id}|medium")])
+        keyboard.append([InlineKeyboardButton("High Audio (MP3)", callback_data=f"dl|{request_id}|high")])
+        keyboard.append([InlineKeyboardButton("Voice Message (OGG)", callback_data=f"dl|{request_id}|voice")])
         keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel|000")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -588,12 +637,19 @@ async def execute_video_download(chat_id, url, context, status_msg=None):
             return
             
         await update_status("Uploading video to Telegram...")
+        video_buttons = [
+            [
+                InlineKeyboardButton("☕ Buy Me a Coffee", callback_data="donate"),
+                InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
+            ]
+        ]
         with open(mp4_path, "rb") as vf:
             await context.bot.send_video(
                 chat_id=chat_id,
                 video=vf,
                 caption=f"{metadata.get('title', 'Video')}\nSize: {file_size_mb:.2f} MB",
-                supports_streaming=True
+                supports_streaming=True,
+                reply_markup=InlineKeyboardMarkup(video_buttons)
             )
         if status_msg:
             await context.bot.delete_message(chat_id, status_msg.message_id)
@@ -655,7 +711,14 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
         if len(search_bytes) > 50:
             search_str = search_bytes[:50].decode('utf-8', errors='ignore')
             
-        btn = InlineKeyboardMarkup([[InlineKeyboardButton("📝 View Lyrics", callback_data=f"lyrics|{search_str}")]])
+        action_buttons = []
+        if search_str:
+            action_buttons.append([InlineKeyboardButton("📝 View Lyrics", callback_data=f"lyrics|{search_str}")])
+        action_buttons.append([
+            InlineKeyboardButton("☕ Buy Me a Coffee", callback_data="donate"),
+            InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
+        ])
+        btn = InlineKeyboardMarkup(action_buttons)
         
         if is_voice:
             with open(media_path, "rb") as vf:
@@ -708,6 +771,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = query.data
     user_id = update.effective_user.id
     
+    if data == "donate":
+        await send_donation_info(update.effective_chat.id, context)
+        return
+
     if data.startswith("lyrics|"):
         search_term = data.split("|", 1)[1]
         await context.bot.send_message(update.effective_chat.id, f"Looking up lyrics for: {search_term}...")
@@ -730,10 +797,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         dl_prefix = "dlpl" if "pl" in prefix else "dl"
         
         keyboard = [
-            [InlineKeyboardButton("Standard (128 kbps)", callback_data=f"{dl_prefix}|{req_id}|standard")],
-            [InlineKeyboardButton("Medium (192 kbps)", callback_data=f"{dl_prefix}|{req_id}|medium")],
-            [InlineKeyboardButton("High (320 kbps)", callback_data=f"{dl_prefix}|{req_id}|high")],
-            [InlineKeyboardButton("Voice Note", callback_data=f"{dl_prefix}|{req_id}|voice")],
+            [InlineKeyboardButton("Standard Audio (MP3)", callback_data=f"{dl_prefix}|{req_id}|standard")],
+            [InlineKeyboardButton("Medium Audio (MP3)", callback_data=f"{dl_prefix}|{req_id}|medium")],
+            [InlineKeyboardButton("High Audio (MP3)", callback_data=f"{dl_prefix}|{req_id}|high")],
+            [InlineKeyboardButton("Voice Message (OGG)", callback_data=f"{dl_prefix}|{req_id}|voice")],
             [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
         ]
         return await query.edit_message_text("Select audio quality:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -837,6 +904,8 @@ def main() -> None:
     application.add_handler(CommandHandler("trending", trending_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("quality", quality_command))
+    application.add_handler(CommandHandler("donate", donate_command))
+    application.add_handler(CommandHandler("feedback", feedback_command))
     application.add_handler(CommandHandler("terms", terms_command))
     application.add_handler(CommandHandler("about", about_command))
     application.add_handler(CallbackQueryHandler(handle_callbacks))
