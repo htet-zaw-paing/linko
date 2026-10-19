@@ -50,6 +50,7 @@ user_last_request: dict[int, float] = {}
 user_active_tasks: dict[int, int] = {}
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 MAX_PLAYLIST_ITEMS = 10
+PROCESS_TIMEOUT = 240  # 4 minutes max per job
 
 MAX_QUEUE_CAPACITY = 100
 current_in_queue = 0
@@ -57,6 +58,7 @@ queue_counter_lock = asyncio.Lock()
 
 GLOBAL_SESSION = {}
 FILE_ID_CACHE: dict[str, dict] = {}
+GLOBAL_CANCEL_FLAGS = set()
 
 COBALT_ENDPOINTS = [
     "https://rue-cobalt.xenon.zone",
@@ -148,7 +150,7 @@ def is_safe_public_url(text: str) -> tuple[bool, str]:
 def fetch_lrclib_lyrics(query: str) -> str:
     headers = {"User-Agent": "LinkoBot (https://t.me/LinkoBot)"}
     try:
-        r = requests.get(f"https://lrclib.net/api/search?q={urllib.parse.quote(query)}", headers=headers, timeout=10)
+        r = requests.get(f"https://lrclib.net/api/search?q={urllib.parse.quote(query)}", headers=headers, timeout=5)
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, list) and len(data) > 0:
@@ -181,7 +183,7 @@ def FastCheckAudioBypass(url: str, bitrate: str) -> dict | None:
     }
     for api in COBALT_ENDPOINTS:
         try:
-            resp = requests.post(api, json=payload, headers=headers, timeout=10)
+            resp = requests.post(api, json=payload, headers=headers, timeout=3)
             if resp.status_code == 200:
                 data = resp.json()
                 dl_url = data.get("url")
@@ -191,7 +193,7 @@ def FastCheckAudioBypass(url: str, bitrate: str) -> dict | None:
                 title = title.replace("_", " ")
                 if dl_url:
                     try:
-                        head_resp = requests.head(dl_url, timeout=6, allow_redirects=True)
+                        head_resp = requests.head(dl_url, timeout=3, allow_redirects=True)
                         size = int(head_resp.headers.get("Content-Length", 0))
                         if size > 19.5 * 1024 * 1024:
                             return None
@@ -219,7 +221,7 @@ def FastCheckVideoBypass(url: str) -> dict | None:
     }
     for api in COBALT_ENDPOINTS:
         try:
-            resp = requests.post(api, json=payload, headers=headers, timeout=10)
+            resp = requests.post(api, json=payload, headers=headers, timeout=3)
             if resp.status_code == 200:
                 data = resp.json()
                 dl_url = data.get("url")
@@ -229,7 +231,7 @@ def FastCheckVideoBypass(url: str) -> dict | None:
                 title = title.replace("_", " ")
                 if dl_url:
                     try:
-                        head_resp = requests.head(dl_url, timeout=6, allow_redirects=True)
+                        head_resp = requests.head(dl_url, timeout=3, allow_redirects=True)
                         size = int(head_resp.headers.get("Content-Length", 0))
                         if size > 19.5 * 1024 * 1024:
                             return None
@@ -244,30 +246,32 @@ def FastCheckVideoBypass(url: str) -> dict | None:
             continue
     return None
 
-def run_ytdlp_with_fallback(ydl_opts: dict, url: str, start_sec: int = None, end_sec: int = None) -> tuple[dict, str, str]:
+def run_ytdlp_with_fallback(ydl_opts: dict, url: str, start_sec: int = None, end_sec: int = None, req_id: str = None) -> tuple[dict, str, str]:
     has_cookies = os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0
     attempts = [False, True] if not has_cookies else [True, False]
     last_err = None
 
+    def _cancel_hook(d):
+        if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+            raise InterruptedError("Process canceled by user.")
+
     for use_cookie in attempts:
         opts = dict(ydl_opts)
+        opts["progress_hooks"] = [_cancel_hook]
+        
         if use_cookie and has_cookies:
             opts["cookiefile"] = COOKIES_FILE_PATH
-            opts["extractor_args"] = {
-                "youtube": {
-                    "player_client": ["tv_embedded", "android_vr", "ios", "web"],
-                }
-            }
+            opts["extractor_args"] = {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios", "web"]}}
         else:
             opts.pop("cookiefile", None)
-            opts["extractor_args"] = {
-                "youtube": {
-                    "player_client": ["tv_embedded", "android_vr", "ios"],
-                }
-            }
+            opts["extractor_args"] = {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios"]}}
+            
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
+                if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+                    raise InterruptedError("Process canceled by user.")
+                    
                 if not info:
                     raise ValueError("Could not read the media information.")
                 if "entries" in info:
@@ -291,56 +295,49 @@ def run_ytdlp_with_fallback(ydl_opts: dict, url: str, start_sec: int = None, end
         except ValueError as ve:
             raise ve
         except Exception as e:
+            if "canceled" in str(e).lower() or isinstance(e, InterruptedError):
+                raise InterruptedError("Process canceled by user.")
             last_err = e
             continue
 
     raise last_err
 
-def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice: bool = False, start_sec: int = None, end_sec: int = None) -> dict:
+def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice: bool = False, start_sec: int = None, end_sec: int = None, req_id: str = None) -> dict:
     job_dir = os.path.dirname(output_template)
 
     if start_sec is None and not url.startswith("ytsearch"):
-        payload = {
-            "url": url,
-            "downloadMode": "audio",
-            "audioFormat": "mp3",
-            "audioBitrate": bitrate,
-        }
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        }
+        payload = {"url": url, "downloadMode": "audio", "audioFormat": "mp3", "audioBitrate": bitrate}
+        headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         
         for api in COBALT_ENDPOINTS:
+            if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+                raise InterruptedError("Process canceled by user.")
             try:
-                resp = requests.post(api, json=payload, headers=headers, timeout=12)
+                resp = requests.post(api, json=payload, headers=headers, timeout=3)
                 if resp.status_code == 200:
                     dl_url = resp.json().get("url")
                     title = resp.json().get("filename", "Audio").replace("_", " ")
                     if dl_url:
                         raw_file = os.path.join(job_dir, "raw_audio_temp")
-                        with requests.get(dl_url, stream=True, timeout=25) as r:
+                        with requests.get(dl_url, stream=True, timeout=10) as r:
                             r.raise_for_status()
                             with open(raw_file, "wb") as f:
                                 for chunk in r.iter_content(chunk_size=65536):
+                                    if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+                                        raise InterruptedError("Process canceled by user.")
                                     f.write(chunk)
                         
                         if is_voice:
                             final_ogg = os.path.join(job_dir, "voice_track.ogg")
                             subprocess.run(
                                 ["ffmpeg", "-y", "-threads", "0", "-i", raw_file, "-c:a", "libopus", "-b:a", f"{bitrate}k", final_ogg],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                check=True
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
                             )
                         else:
                             final_mp3 = os.path.join(job_dir, "audio_track.mp3")
                             subprocess.run(
                                 ["ffmpeg", "-y", "-threads", "0", "-i", raw_file, "-vn", "-ar", "44100", "-ac", "2", "-b:a", f"{bitrate}k", final_mp3],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                check=True
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
                             )
 
                         return {
@@ -349,6 +346,8 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
                             "duration": 0,
                             "webpage_url": url,
                         }
+            except InterruptedError as ie:
+                raise ie
             except Exception:
                 continue
 
@@ -361,16 +360,14 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
         "no_warnings": True,
         "geo_bypass": True,
         "nocheckcertificate": True,
-        "socket_timeout": 20,
+        "socket_timeout": 15,
         "retries": 2,
         "extractor_retries": 2,
         "fragment_retries": 2,
         "max_filesize": 50 * 1024 * 1024,
         "writethumbnail": not is_voice,
         "postprocessor_args": {"ffmpeg": ["-threads", "0"]},
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        },
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     }
 
     if start_sec is not None and end_sec is not None:
@@ -379,18 +376,14 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
 
     if not is_voice:
         ydl_opts["postprocessors"] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": bitrate,
-            },
-            {
-                "key": "FFmpegThumbnailsConvertor",
-                "format": "jpg",
-            }
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": bitrate},
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg"}
         ]
 
-    info, title, uploader = run_ytdlp_with_fallback(ydl_opts, url, start_sec, end_sec)
+    info, title, uploader = run_ytdlp_with_fallback(ydl_opts, url, start_sec, end_sec, req_id)
+
+    if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+        raise InterruptedError("Process canceled by user.")
 
     if is_voice:
         raw_file = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.startswith("audio_track")), None)
@@ -398,44 +391,39 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
             final_ogg = os.path.join(job_dir, "voice_track.ogg")
             subprocess.run(
                 ["ffmpeg", "-y", "-threads", "0", "-i", raw_file, "-c:a", "libopus", "-b:a", f"{bitrate}k", final_ogg],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
             )
             if os.path.exists(raw_file):
                 os.remove(raw_file)
 
-    return {
-        "title": title,
-        "uploader": uploader,
-        "duration": info.get("duration") or 0,
-        "webpage_url": info.get("webpage_url", url),
-    }
+    return {"title": title, "uploader": uploader, "duration": info.get("duration") or 0, "webpage_url": info.get("webpage_url", url)}
 
-def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None, end_sec: int = None) -> dict:
+def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None, end_sec: int = None, req_id: str = None) -> dict:
     job_dir = os.path.dirname(output_template)
     
     if start_sec is None and not url.startswith("ytsearch"):
         payload = {"url": url, "downloadMode": "auto"}
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        }
+        headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         
         for api in COBALT_ENDPOINTS:
+            if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+                raise InterruptedError("Process canceled by user.")
             try:
-                resp = requests.post(api, json=payload, headers=headers, timeout=12)
+                resp = requests.post(api, json=payload, headers=headers, timeout=3)
                 if resp.status_code == 200 and resp.json().get("url"):
                     dl_url = resp.json().get("url")
                     title = resp.json().get("filename", "Video").replace("_", " ")
                     final_mp4 = os.path.join(job_dir, "video_track.mp4")
-                    with requests.get(dl_url, stream=True, timeout=30) as r:
+                    with requests.get(dl_url, stream=True, timeout=10) as r:
                         r.raise_for_status()
                         with open(final_mp4, "wb") as f:
                             for chunk in r.iter_content(chunk_size=65536):
+                                if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+                                    raise InterruptedError("Process canceled by user.")
                                 f.write(chunk)
                     return {"title": title[:80] or "Video", "uploader": "Linko"}
+            except InterruptedError as ie:
+                raise ie
             except Exception:
                 continue
             
@@ -450,20 +438,20 @@ def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None,
         "nocheckcertificate": True,
         "max_filesize": 50 * 1024 * 1024,
         "postprocessor_args": {"ffmpeg": ["-threads", "0"]},
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        },
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     }
     
     if start_sec is not None and end_sec is not None:
         ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)])
         ydl_opts["force_keyframes_at_cuts"] = True
         
-    _, title, uploader = run_ytdlp_with_fallback(ydl_opts, url, start_sec, end_sec)
+    _, title, uploader = run_ytdlp_with_fallback(ydl_opts, url, start_sec, end_sec, req_id)
     return {"title": title, "uploader": uploader}
 
 def explain_download_error(error: Exception) -> str:
     message = str(error).lower()
+    if "canceled" in message:
+        return "Process was canceled by the user."
     if any((term in message for term in ("sign in to confirm", "not a bot"))):
         return "The website blocked access. The bot needs updated cookies to download this."
     if any((term in message for term in ("sign in", "login required", "private", "authentication"))):
@@ -541,10 +529,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             try:
                 status_msg = await update.message.reply_text("⚡ Processing download from inline search...")
                 if is_video:
-                    await execute_video_download(update.effective_chat.id, url, context, status_msg)
+                    await asyncio.wait_for(execute_video_download(update.effective_chat.id, url, context, status_msg, req_id=req_id), timeout=PROCESS_TIMEOUT)
                 else:
-                    await execute_download(update.effective_chat.id, url, quality_key, context, status_msg, "")
+                    await asyncio.wait_for(execute_download(update.effective_chat.id, url, quality_key, context, status_msg, "", req_id=req_id), timeout=PROCESS_TIMEOUT)
+            except (asyncio.TimeoutError, TimeoutError):
+                GLOBAL_CANCEL_FLAGS.add(req_id)
+                await context.bot.send_message(update.effective_chat.id, "⏳ The request took too long (over 4 minutes) and was automatically canceled. Please try again.")
+            except InterruptedError:
+                pass 
             finally:
+                GLOBAL_CANCEL_FLAGS.discard(req_id)
                 if user_active_tasks[user_id] > 0:
                     user_active_tasks[user_id] -= 1
             return
@@ -589,7 +583,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>📖 Detailed Guides:</b>\n"
         "• <a href='https://telegra.ph/Linko---User-Guide-10-17'>Read the English Guide</a>\n"
         "• <a href='https://telegra.ph/Linko---User-Guide-MM-10-17'>မြန်မာလမ်းညွှန် ဖတ်ရန်</a>\n\n"
-        "<i>Limits: Max 30 minutes length, max 50 MB file size limit.</i>"
+        "<i>Limits: Max 30 mins length, max 50 MB file size limit, 4 min processing limit.</i>"
     )
     await update.message.reply_text(
         help_text, 
@@ -656,7 +650,6 @@ async def send_donation_info(chat_id, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as e:
             logger.error(f"Failed to send QR image from URL: {e}")
             
-    # Fallback if no QR link is provided so the text still makes sense
     fallback_caption = donate_caption.replace(" scanning the KBZPay QR code above", " supporting our project")
     await context.bot.send_message(chat_id=chat_id, text=fallback_caption)
 
@@ -925,13 +918,16 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text("⚡ Link verified! Choose your download format:", reply_markup=reply_markup)
 
-async def execute_video_download(chat_id, url, context, status_msg=None, start_sec=None, end_sec=None):
+async def execute_video_download(chat_id, url, context, status_msg=None, start_sec=None, end_sec=None, req_id=None):
     global current_in_queue
+    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Cancel Processing", callback_data=f"abort|{req_id}")]]) if req_id else None
 
     async def update_status(text):
+        if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+            return
         if status_msg:
             try:
-                await context.bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id, parse_mode="HTML")
+                await context.bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id, parse_mode="HTML", reply_markup=cancel_kb)
             except Exception:
                 pass
 
@@ -1015,6 +1011,9 @@ async def execute_video_download(chat_id, url, context, status_msg=None, start_s
                 current_in_queue -= 1
                 in_queue = False
 
+            if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+                return
+
             if start_sec is not None:
                 await update_status("✂️ Clipping video directly from the server...")
             else:
@@ -1026,7 +1025,7 @@ async def execute_video_download(chat_id, url, context, status_msg=None, start_s
             output_template = os.path.join(job_dir, "video_track.mp4")
             
             try:
-                metadata = await asyncio.to_thread(BlockingDownloadVideo, url, output_template, start_sec, end_sec)
+                metadata = await asyncio.to_thread(BlockingDownloadVideo, url, output_template, start_sec, end_sec, req_id)
                 
                 await update_status("⚡ Uploading video to Telegram...")
 
@@ -1065,6 +1064,8 @@ async def execute_video_download(chat_id, url, context, status_msg=None, start_s
                     except Exception:
                         pass
                     
+            except InterruptedError:
+                await update_status("🚫 Process canceled by user.")
             except Exception as e:
                 await update_status(f"Error: {explain_download_error(e)}")
             finally:
@@ -1077,16 +1078,19 @@ async def execute_video_download(chat_id, url, context, status_msg=None, start_s
                 current_in_queue -= 1
         gc.collect()
 
-async def execute_download(chat_id, url, preset_key, context, status_msg=None, status_prefix="", start_sec=None, end_sec=None):
+async def execute_download(chat_id, url, preset_key, context, status_msg=None, status_prefix="", start_sec=None, end_sec=None, req_id=None):
     global current_in_queue
     preset = QUALITY_PRESETS.get(preset_key, QUALITY_PRESETS["medium"])
     bitrate = preset["bitrate"]
     is_voice = preset["type"] == "voice"
+    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Cancel Processing", callback_data=f"abort|{req_id}")]]) if req_id else None
 
     async def update_status(text):
+        if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+            return
         if status_msg:
             try: 
-                await context.bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id, parse_mode="HTML")
+                await context.bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id, parse_mode="HTML", reply_markup=cancel_kb)
             except Exception: 
                 pass
 
@@ -1178,6 +1182,9 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
                 current_in_queue -= 1
                 in_queue = False
 
+            if req_id and req_id in GLOBAL_CANCEL_FLAGS:
+                return
+
             if start_sec is not None:
                 await update_status(f"{status_prefix}✂️ Clipping ({preset['label']})... Please wait a moment.")
             else:
@@ -1189,7 +1196,7 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
             output_template = os.path.join(job_dir, "audio_track.%(ext)s")
             
             try:
-                metadata = await asyncio.to_thread(BlockingDownloadAudio, url, bitrate, output_template, is_voice, start_sec, end_sec)
+                metadata = await asyncio.to_thread(BlockingDownloadAudio, url, bitrate, output_template, is_voice, start_sec, end_sec, req_id)
                 await update_status(f"{status_prefix}⚡ Uploading audio to Telegram...")
                 
                 raw_title = metadata.get('title', 'Audio Track')
@@ -1276,6 +1283,8 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
                     except Exception:
                         pass
                     
+            except InterruptedError:
+                await update_status(f"{status_prefix}🚫 Process canceled by user.")
             except ValueError as ve:
                 await update_status(f"{status_prefix}Error: {ve}")
             except Exception as e:
@@ -1298,6 +1307,15 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     if data == "donate":
         await send_donation_info(update.effective_chat.id, context)
+        return
+        
+    if data.startswith("abort|"):
+        req_id = data.split("|")[1]
+        GLOBAL_CANCEL_FLAGS.add(req_id)
+        try:
+            await query.edit_message_text("🚫 Process canceled by user.")
+        except Exception:
+            pass
         return
 
     if data.startswith("lyrics|"):
@@ -1361,8 +1379,14 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             msg = "⚡ Starting download..." if start_sec is None else "✂️ Added clip to queue..."
             await query.edit_message_text(msg)
-            await execute_video_download(update.effective_chat.id, url, context, query.message, start_sec, end_sec)
+            await asyncio.wait_for(execute_video_download(update.effective_chat.id, url, context, query.message, start_sec, end_sec, req_id=req_id), timeout=PROCESS_TIMEOUT)
+        except (asyncio.TimeoutError, TimeoutError):
+            GLOBAL_CANCEL_FLAGS.add(req_id)
+            await context.bot.send_message(update.effective_chat.id, "⏳ The request took too long (over 4 minutes) and was automatically canceled. Please try again.")
+        except InterruptedError:
+            pass
         finally:
+            GLOBAL_CANCEL_FLAGS.discard(req_id)
             if user_active_tasks[user_id] > 0:
                 user_active_tasks[user_id] -= 1
         return
@@ -1398,7 +1422,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if prefix in ("dl", "dli", "dlc"):
                 msg = f"⚡ Starting download ({preset['label']})..." if start_sec is None else f"✂️ Added clip to queue ({preset['label']})..."
                 await query.edit_message_text(msg)
-                await execute_download(update.effective_chat.id, url, quality_key, context, query.message, "", start_sec, end_sec)
+                await asyncio.wait_for(execute_download(update.effective_chat.id, url, quality_key, context, query.message, "", start_sec, end_sec, req_id=req_id), timeout=PROCESS_TIMEOUT)
             else:
                 await query.edit_message_text("📂 Loading playlist details...")
                 def get_playlist():
@@ -1420,28 +1444,24 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     
                 entries = list(entries)[:MAX_PLAYLIST_ITEMS]
                 
-                await query.edit_message_text(
-                    f"📂 Playlist queued: {len(entries)} tracks. Downloading sequentially."
-                )
+                await query.edit_message_text(f"📂 Playlist queued: {len(entries)} tracks. Downloading sequentially.")
                 
                 for i, entry in enumerate(entries, 1):
+                    if req_id in GLOBAL_CANCEL_FLAGS:
+                        break
                     if not entry.get("url"): 
                         continue
-                    status_msg = await context.bot.send_message(
-                        update.effective_chat.id, 
-                        f"[Track {i}/{len(entries)}] ⚡ Starting download..."
-                    )
-                    await execute_download(
-                        update.effective_chat.id, 
-                        entry["url"], 
-                        quality_key, 
-                        context, 
-                        status_msg, 
-                        f"[Track {i}/{len(entries)}] "
-                    )
+                    status_msg = await context.bot.send_message(update.effective_chat.id, f"[Track {i}/{len(entries)}] ⚡ Starting download...")
+                    await asyncio.wait_for(execute_download(update.effective_chat.id, entry["url"], quality_key, context, status_msg, f"[Track {i}/{len(entries)}] ", req_id=req_id), timeout=PROCESS_TIMEOUT)
                     gc.collect()
                     await asyncio.sleep(1.5)
+        except (asyncio.TimeoutError, TimeoutError):
+            GLOBAL_CANCEL_FLAGS.add(req_id)
+            await context.bot.send_message(update.effective_chat.id, "⏳ The request took too long (over 4 minutes) and was automatically canceled. Please try again.")
+        except InterruptedError:
+            pass
         finally:
+            GLOBAL_CANCEL_FLAGS.discard(req_id)
             if user_active_tasks[user_id] > 0:
                 user_active_tasks[user_id] -= 1
 
