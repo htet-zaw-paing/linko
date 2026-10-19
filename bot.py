@@ -56,7 +56,6 @@ current_in_queue = 0
 queue_counter_lock = asyncio.Lock()
 
 GLOBAL_SESSION = {}
-FILE_ID_CACHE: dict[str, dict] = {}
 
 QUALITY_PRESETS = {
     "standard": {"label": "Standard Audio (MP3)", "bitrate": "128", "type": "audio"},
@@ -155,99 +154,10 @@ def parse_time_to_seconds(t_str: str) -> int:
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     return int(t_str)
 
-def FastCheckAudioBypass(url: str, bitrate: str) -> dict | None:
-    if url.startswith("ytsearch"):
-        return None
-    payload = {
-        "url": url,
-        "downloadMode": "audio",
-        "audioFormat": "mp3",
-        "audioBitrate": bitrate,
-    }
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    }
-    endpoints = [
-        "https://cobalt-api.kwiatekmiki.com",
-        "https://cobalt-backend.canine.tools",
-        "https://cbl.wuk.sh"
-    ]
-    for api in endpoints:
-        try:
-            resp = requests.post(api, json=payload, headers=headers, timeout=12)
-            if resp.status_code == 200:
-                data = resp.json()
-                dl_url = data.get("url")
-                title = data.get("filename", "Audio Track")
-                if title.lower().endswith(".mp3"):
-                    title = title[:-4]
-                title = title.replace("_", " ")
-                if dl_url:
-                    try:
-                        head_resp = requests.head(dl_url, timeout=8, allow_redirects=True)
-                        size = int(head_resp.headers.get("Content-Length", 0))
-                        if size > 19.5 * 1024 * 1024:
-                            return None
-                    except Exception:
-                        pass
-                    return {
-                        "title": title[:80] or "Audio Track",
-                        "uploader": "Linko",
-                        "duration": 0,
-                        "webpage_url": url,
-                        "direct_url": dl_url
-                    }
-        except Exception:
-            continue
-    return None
-
-def FastCheckVideoBypass(url: str) -> dict | None:
-    if url.startswith("ytsearch"):
-        return None
-    payload = {"url": url, "downloadMode": "auto"}
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    }
-    endpoints = [
-        "https://cobalt-api.kwiatekmiki.com",
-        "https://cobalt-backend.canine.tools",
-        "https://cbl.wuk.sh"
-    ]
-    for api in endpoints:
-        try:
-            resp = requests.post(api, json=payload, headers=headers, timeout=12)
-            if resp.status_code == 200:
-                data = resp.json()
-                dl_url = data.get("url")
-                title = data.get("filename", "Video")
-                if title.lower().endswith(".mp4"):
-                    title = title[:-4]
-                title = title.replace("_", " ")
-                if dl_url:
-                    try:
-                        head_resp = requests.head(dl_url, timeout=8, allow_redirects=True)
-                        size = int(head_resp.headers.get("Content-Length", 0))
-                        if size > 19.5 * 1024 * 1024:
-                            return None
-                    except Exception:
-                        pass
-                    return {
-                        "title": title[:80] or "Video",
-                        "uploader": "Linko",
-                        "direct_url": dl_url
-                    }
-        except Exception:
-            continue
-    return None
-
 def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice: bool = False, start_sec: int = None, end_sec: int = None) -> dict:
     job_dir = os.path.dirname(output_template)
 
-    if start_sec is None and not url.startswith("ytsearch"):
+    if start_sec is None:
         payload = {
             "url": url,
             "downloadMode": "audio",
@@ -272,6 +182,21 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
                     dl_url = resp.json().get("url")
                     title = resp.json().get("filename", "Audio").replace("_", " ")
                     if dl_url:
+                        if not is_voice:
+                            try:
+                                head_resp = requests.head(dl_url, timeout=10)
+                                size = int(head_resp.headers.get("Content-Length", 0))
+                                if 0 < size < 19.5 * 1024 * 1024:
+                                    return {
+                                        "title": title[:80] or "Audio Track",
+                                        "uploader": "Linko",
+                                        "duration": 0,
+                                        "webpage_url": url,
+                                        "direct_url": dl_url
+                                    }
+                            except Exception:
+                                pass
+
                         raw_file = os.path.join(job_dir, "raw_audio_temp")
                         with requests.get(dl_url, stream=True, timeout=25) as r:
                             r.raise_for_status()
@@ -354,11 +279,6 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
         info = ydl.extract_info(url, download=False)
         if not info:
             raise ValueError("Could not read the media information.")
-        if "entries" in info:
-            entries = list(info.get("entries") or [])
-            if not entries:
-                raise ValueError("No results found.")
-            info = entries[0]
         if info.get("is_live"):
             raise ValueError("Live streams cannot be downloaded.")
             
@@ -395,7 +315,7 @@ def BlockingDownloadAudio(url: str, bitrate: str, output_template: str, is_voice
 def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None, end_sec: int = None) -> dict:
     job_dir = os.path.dirname(output_template)
     
-    if start_sec is None and not url.startswith("ytsearch"):
+    if start_sec is None:
         payload = {"url": url, "downloadMode": "auto"}
         headers = {"Accept": "application/json", "Content-Type": "application/json"}
         endpoints = [
@@ -410,6 +330,15 @@ def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None,
                 if resp.status_code == 200 and resp.json().get("url"):
                     dl_url = resp.json().get("url")
                     title = resp.json().get("filename", "Video").replace("_", " ")
+                    
+                    try:
+                        head_resp = requests.head(dl_url, timeout=10)
+                        size = int(head_resp.headers.get("Content-Length", 0))
+                        if 0 < size < 19.5 * 1024 * 1024:
+                            return {"title": title[:80] or "Video", "uploader": "Linko", "direct_url": dl_url}
+                    except Exception:
+                        pass
+
                     final_mp4 = os.path.join(job_dir, "video_track.mp4")
                     with requests.get(dl_url, stream=True, timeout=30) as r:
                         r.raise_for_status()
@@ -447,10 +376,6 @@ def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None,
         
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        if "entries" in info:
-            entries = list(info.get("entries") or [])
-            if entries:
-                info = entries[0]
         return {"title": info.get("title", "Video"), "uploader": info.get("uploader", "Linko")}
 
 def explain_download_error(error: Exception) -> str:
@@ -468,26 +393,6 @@ def explain_download_error(error: Exception) -> str:
     if "ffmpeg" in message or "ffprobe" in message or "postprocessing" in message:
         return "The audio conversion failed. The file format might not be supported."
     return "Could not download the media. Make sure the link is public and valid."
-
-def build_audio_buttons(raw_title: str, uploader: str) -> tuple[InlineKeyboardMarkup, str]:
-    uploader_clean = uploader.replace(' - Topic', '')
-    clean_title = re.sub(r'(?i)(\(official.*?\)|\[official.*?\]|\(music video.*?\)|\(lyric.*?\)|\[lyric.*?\]|\(audio.*?\)|\[audio.*?\]|\(live.*?\))', '', raw_title).strip()
-    if uploader_clean.lower() not in clean_title.lower() and uploader_clean.lower() != "linko":
-        search_str = f"{clean_title} {uploader_clean}"
-    else:
-        search_str = clean_title
-    search_str = search_str.strip()
-    search_bytes = search_str.encode('utf-8')
-    if len(search_bytes) > 50:
-        search_str = search_bytes[:50].decode('utf-8', errors='ignore')
-    action_buttons = []
-    if search_str:
-        action_buttons.append([InlineKeyboardButton("View Lyrics", callback_data=f"lyrics|{search_str}")])
-    action_buttons.append([
-        InlineKeyboardButton("Buy Me a Coffee", callback_data="donate"),
-        InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
-    ])
-    return InlineKeyboardMarkup(action_buttons), clean_title
 
 async def post_init(application) -> None:
     commands = [
@@ -899,66 +804,6 @@ async def execute_video_download(chat_id, url, context, status_msg=None, start_s
             except Exception:
                 pass
 
-    video_buttons = [
-        [
-            InlineKeyboardButton("Buy Me a Coffee", callback_data="donate"),
-            InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
-        ]
-    ]
-    cache_key = f"vid|{url}|{start_sec}|{end_sec}"
-
-    if cache_key in FILE_ID_CACHE:
-        cached = FILE_ID_CACHE[cache_key]
-        try:
-            await context.bot.send_video(
-                chat_id=chat_id,
-                video=cached["file_id"],
-                caption=cached["caption"],
-                supports_streaming=True,
-                reply_markup=InlineKeyboardMarkup(video_buttons)
-            )
-            if status_msg:
-                try:
-                    await context.bot.delete_message(chat_id, status_msg.message_id)
-                except Exception:
-                    pass
-            return
-        except Exception:
-            FILE_ID_CACHE.pop(cache_key, None)
-
-    if start_sec is None:
-        await update_status("Processing your request. Fetching video stream...")
-        fast_meta = await asyncio.to_thread(FastCheckVideoBypass, url)
-        if fast_meta and fast_meta.get("direct_url"):
-            try:
-                await update_status("Uploading video to Telegram...")
-                caption_text = f"{fast_meta.get('title', 'Video')}\nSize: < 20 MB (Direct URL)"
-                sent_msg = await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=fast_meta["direct_url"],
-                    caption=caption_text,
-                    supports_streaming=True,
-                    reply_markup=InlineKeyboardMarkup(video_buttons),
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=60
-                )
-                if sent_msg and sent_msg.video:
-                    if len(FILE_ID_CACHE) > 500:
-                        FILE_ID_CACHE.clear()
-                    FILE_ID_CACHE[cache_key] = {
-                        "file_id": sent_msg.video.file_id,
-                        "caption": caption_text
-                    }
-                if status_msg:
-                    try:
-                        await context.bot.delete_message(chat_id, status_msg.message_id)
-                    except Exception:
-                        pass
-                return
-            except Exception:
-                pass
-
     async with queue_counter_lock:
         if current_in_queue >= MAX_QUEUE_CAPACITY:
             await update_status("Traffic Alert: Over 100 requests in line right now. Please try again in 1-2 minutes.")
@@ -993,35 +838,45 @@ async def execute_video_download(chat_id, url, context, status_msg=None, start_s
                 metadata = await asyncio.to_thread(BlockingDownloadVideo, url, output_template, start_sec, end_sec)
                 
                 await update_status("Uploading video to Telegram...")
+                video_buttons = [
+                    [
+                        InlineKeyboardButton("Buy Me a Coffee", callback_data="donate"),
+                        InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
+                    ]
+                ]
 
-                mp4_path = os.path.join(job_dir, "video_track.mp4")
-                if not os.path.exists(mp4_path):
-                    raise ValueError("The video file could not be generated.")
-                    
-                file_size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
-                if file_size_mb > 49.5:
-                    await update_status(f"This video is too large ({file_size_mb:.2f} MB). Telegram limits bots to 50 MB.")
-                    return
-                    
-                caption_text = f"{metadata.get('title', 'Video')}\nSize: {file_size_mb:.2f} MB"
-                with open(mp4_path, "rb") as vf:
-                    sent_msg = await context.bot.send_video(
+                if metadata.get("direct_url"):
+                    await context.bot.send_video(
                         chat_id=chat_id,
-                        video=vf,
-                        caption=caption_text,
+                        video=metadata["direct_url"],
+                        caption=f"{metadata.get('title', 'Video')}\nSize: < 20 MB (Direct URL)",
                         supports_streaming=True,
                         reply_markup=InlineKeyboardMarkup(video_buttons),
                         read_timeout=120,
                         write_timeout=120,
                         connect_timeout=60
                     )
-                    if sent_msg and sent_msg.video:
-                        if len(FILE_ID_CACHE) > 500:
-                            FILE_ID_CACHE.clear()
-                        FILE_ID_CACHE[cache_key] = {
-                            "file_id": sent_msg.video.file_id,
-                            "caption": caption_text
-                        }
+                else:
+                    mp4_path = os.path.join(job_dir, "video_track.mp4")
+                    if not os.path.exists(mp4_path):
+                        raise ValueError("The video file could not be generated.")
+                        
+                    file_size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
+                    if file_size_mb > 49.5:
+                        await update_status(f"This video is too large ({file_size_mb:.2f} MB). Telegram limits bots to 50 MB.")
+                        return
+                        
+                    with open(mp4_path, "rb") as vf:
+                        await context.bot.send_video(
+                            chat_id=chat_id,
+                            video=vf,
+                            caption=f"{metadata.get('title', 'Video')}\nSize: {file_size_mb:.2f} MB",
+                            supports_streaming=True,
+                            reply_markup=InlineKeyboardMarkup(video_buttons),
+                            read_timeout=120,
+                            write_timeout=120,
+                            connect_timeout=60
+                        )
 
                 if status_msg:
                     try:
@@ -1052,74 +907,6 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
             try: 
                 await context.bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg.message_id, parse_mode="HTML")
             except Exception: 
-                pass
-
-    cache_key = f"aud|{url}|{preset_key}|{start_sec}|{end_sec}"
-
-    if cache_key in FILE_ID_CACHE:
-        cached = FILE_ID_CACHE[cache_key]
-        try:
-            btn, _ = build_audio_buttons(cached["title"], cached["uploader"])
-            if is_voice:
-                await context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=cached["file_id"],
-                    caption=cached["caption"],
-                    reply_markup=btn
-                )
-            else:
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=cached["file_id"],
-                    caption=cached["caption"],
-                    reply_markup=btn
-                )
-            if status_msg:
-                try:
-                    await context.bot.delete_message(chat_id, status_msg.message_id)
-                except Exception:
-                    pass
-            return
-        except Exception:
-            FILE_ID_CACHE.pop(cache_key, None)
-
-    if start_sec is None and not is_voice:
-        await update_status(f"{status_prefix}Processing your request. Fetching ({preset['label']})...")
-        fast_meta = await asyncio.to_thread(FastCheckAudioBypass, url, bitrate)
-        if fast_meta and fast_meta.get("direct_url"):
-            try:
-                await update_status(f"{status_prefix}Uploading audio to Telegram...")
-                raw_title = fast_meta.get("title", "Audio Track")
-                uploader = fast_meta.get("uploader", "Linko")
-                btn, _ = build_audio_buttons(raw_title, uploader)
-                caption_text = f"{bitrate} kbps | < 20 MB (Direct URL)"
-                sent_msg = await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=fast_meta["direct_url"],
-                    title=raw_title.replace("_", " "),
-                    performer=uploader.replace("_", " "),
-                    caption=caption_text,
-                    reply_markup=btn,
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=60
-                )
-                if sent_msg and sent_msg.audio:
-                    if len(FILE_ID_CACHE) > 500:
-                        FILE_ID_CACHE.clear()
-                    FILE_ID_CACHE[cache_key] = {
-                        "file_id": sent_msg.audio.file_id,
-                        "title": raw_title,
-                        "uploader": uploader,
-                        "caption": caption_text
-                    }
-                if status_msg:
-                    try:
-                        await context.bot.delete_message(chat_id, status_msg.message_id)
-                    except Exception:
-                        pass
-                return
-            except Exception:
                 pass
 
     async with queue_counter_lock:
@@ -1157,82 +944,94 @@ async def execute_download(chat_id, url, preset_key, context, status_msg=None, s
                 await update_status(f"{status_prefix}Uploading audio to Telegram...")
                 
                 raw_title = metadata.get('title', 'Audio Track')
-                uploader = metadata.get('uploader', 'Linko')
-                btn, clean_title = build_audio_buttons(raw_title, uploader)
+                uploader = metadata.get('uploader', 'Linko').replace(' - Topic', '')
+                clean_title = re.sub(r'(?i)(\(official.*?\)|\[official.*?\]|\(music video.*?\)|\(lyric.*?\)|\[lyric.*?\]|\(audio.*?\)|\[audio.*?\]|\(live.*?\))', '', raw_title).strip()
                 
-                target_ext = ".ogg" if is_voice else ".mp3"
-                files = [os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(target_ext)]
-                if not files:
-                    await update_status(f"{status_prefix}Error: Failed to extract the audio file.")
-                    return
-                    
-                media_path = files[0]
-                file_size_mb = os.path.getsize(media_path) / (1024 * 1024)
-                
-                if file_size_mb > 49.5:
-                    await update_status(f"{status_prefix}This file is too large ({file_size_mb:.2f} MB). Telegram limits bots to 50 MB.")
-                    return
-                    
-                if is_voice:
-                    caption_text = f"{clean_title}\nSize: {file_size_mb:.2f} MB"
-                    with open(media_path, "rb") as vf:
-                        sent_msg = await context.bot.send_voice(
-                            chat_id=chat_id,
-                            voice=vf,
-                            caption=caption_text,
-                            reply_markup=btn,
-                            read_timeout=120,
-                            write_timeout=120,
-                            connect_timeout=60
-                        )
-                        if sent_msg and sent_msg.voice:
-                            if len(FILE_ID_CACHE) > 500:
-                                FILE_ID_CACHE.clear()
-                            FILE_ID_CACHE[cache_key] = {
-                                "file_id": sent_msg.voice.file_id,
-                                "title": raw_title,
-                                "uploader": uploader,
-                                "caption": caption_text
-                            }
+                if uploader.lower() not in clean_title.lower():
+                    search_str = f"{clean_title} {uploader}"
                 else:
-                    thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.jpg')), None)
-                    if thumb_path:
-                        small_thumb = os.path.join(job_dir, "cover_320.jpg")
-                        subprocess.run(
-                            ["ffmpeg", "-y", "-threads", "1", "-i", thumb_path, "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-q:v", "5", small_thumb], 
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                        )
-                        if os.path.exists(small_thumb):
-                            thumb_path = small_thumb
-
-                    caption_text = f"{bitrate} kbps | {file_size_mb:.2f} MB"
-                    with open(media_path, "rb") as audio_file:
-                        thumb_file = open(thumb_path, "rb") if thumb_path else None
-                        try:
-                            sent_msg = await context.bot.send_audio(
+                    search_str = clean_title
+                    
+                search_str = search_str.strip()
+                search_bytes = search_str.encode('utf-8')
+                if len(search_bytes) > 50:
+                    search_str = search_bytes[:50].decode('utf-8', errors='ignore')
+                    
+                action_buttons = []
+                if search_str:
+                    action_buttons.append([InlineKeyboardButton("View Lyrics", callback_data=f"lyrics|{search_str}")])
+                action_buttons.append([
+                    InlineKeyboardButton("Buy Me a Coffee", callback_data="donate"),
+                    InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
+                ])
+                btn = InlineKeyboardMarkup(action_buttons)
+                
+                if metadata.get("direct_url"):
+                    await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=metadata["direct_url"],
+                        title=metadata.get("title", "Audio").replace("_", " "),
+                        performer=metadata.get("uploader", "Linko").replace("_", " "),
+                        caption=f"{bitrate} kbps | < 20 MB (Direct URL)",
+                        reply_markup=btn,
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=60
+                    )
+                else:
+                    target_ext = ".ogg" if is_voice else ".mp3"
+                    files = [os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith(target_ext)]
+                    if not files:
+                        await update_status(f"{status_prefix}Error: Failed to extract the audio file.")
+                        return
+                        
+                    media_path = files[0]
+                    file_size_mb = os.path.getsize(media_path) / (1024 * 1024)
+                    
+                    if file_size_mb > 49.5:
+                        await update_status(f"{status_prefix}This file is too large ({file_size_mb:.2f} MB). Telegram limits bots to 50 MB.")
+                        return
+                        
+                    if is_voice:
+                        with open(media_path, "rb") as vf:
+                            await context.bot.send_voice(
                                 chat_id=chat_id,
-                                audio=audio_file,
-                                title=raw_title.replace("_", " "),
-                                performer=uploader.replace("_", " "),
-                                thumbnail=thumb_file,
-                                caption=caption_text,
+                                voice=vf,
+                                caption=f"{clean_title}\nSize: {file_size_mb:.2f} MB",
                                 reply_markup=btn,
                                 read_timeout=120,
                                 write_timeout=120,
                                 connect_timeout=60
                             )
-                            if sent_msg and sent_msg.audio:
-                                if len(FILE_ID_CACHE) > 500:
-                                    FILE_ID_CACHE.clear()
-                                FILE_ID_CACHE[cache_key] = {
-                                    "file_id": sent_msg.audio.file_id,
-                                    "title": raw_title,
-                                    "uploader": uploader,
-                                    "caption": caption_text
-                                }
-                        finally:
-                            if thumb_file:
-                                thumb_file.close()
+                    else:
+                        thumb_path = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.jpg')), None)
+                        if thumb_path:
+                            small_thumb = os.path.join(job_dir, "cover_320.jpg")
+                            subprocess.run(
+                                ["ffmpeg", "-y", "-i", thumb_path, "-vf", "scale=320:320:force_original_aspect_ratio=decrease", "-q:v", "5", small_thumb], 
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                            )
+                            if os.path.exists(small_thumb):
+                                thumb_path = small_thumb
+
+                        with open(media_path, "rb") as audio_file:
+                            thumb_file = open(thumb_path, "rb") if thumb_path else None
+                            try:
+                                await context.bot.send_audio(
+                                    chat_id=chat_id,
+                                    audio=audio_file,
+                                    title=metadata.get("title", "Audio").replace("_", " "),
+                                    performer=metadata.get("uploader", "Linko").replace("_", " "),
+                                    thumbnail=thumb_file,
+                                    caption=f"{bitrate} kbps | {file_size_mb:.2f} MB",
+                                    reply_markup=btn,
+                                    read_timeout=120,
+                                    write_timeout=120,
+                                    connect_timeout=60
+                                )
+                            finally:
+                                if thumb_file:
+                                    thumb_file.close()
                         
                 if status_msg: 
                     try:
@@ -1323,7 +1122,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
         
         try:
-            msg = "Starting download..." if start_sec is None else "Added clip to queue..."
+            msg = "Added to queue..." if start_sec is None else "Added clip to queue..."
             await query.edit_message_text(msg)
             await execute_video_download(update.effective_chat.id, url, context, query.message, start_sec, end_sec)
         finally:
@@ -1360,7 +1159,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         
         try:
             if prefix in ("dl", "dli", "dlc"):
-                msg = f"Starting download ({preset['label']})..." if start_sec is None else f"Added clip to queue ({preset['label']})..."
+                msg = f"Added to queue ({preset['label']})..." if start_sec is None else f"Added clip to queue ({preset['label']})..."
                 await query.edit_message_text(msg)
                 await execute_download(update.effective_chat.id, url, quality_key, context, query.message, "", start_sec, end_sec)
             else:
@@ -1388,7 +1187,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         continue
                     status_msg = await context.bot.send_message(
                         update.effective_chat.id, 
-                        f"[Track {i}/{len(entries)}] Starting download..."
+                        f"[Track {i}/{len(entries)}] Waiting in queue..."
                     )
                     await execute_download(
                         update.effective_chat.id, 
@@ -1399,7 +1198,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         f"[Track {i}/{len(entries)}] "
                     )
                     gc.collect()
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(2.0)
         finally:
             if user_active_tasks[user_id] > 0:
                 user_active_tasks[user_id] -= 1
