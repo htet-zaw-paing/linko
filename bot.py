@@ -118,9 +118,9 @@ def is_safe_public_url(text: str) -> tuple[bool, str]:
         if result.scheme not in ("http", "https") or not result.netloc:
             return (False, "Please send a valid link starting with http:// or https://")
         
-        blocked_exts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf', '.docx', '.zip']
+        blocked_exts = ['.jpg', '.jpeg', '.png', '.webp', '.pdf', '.docx', '.zip']
         if any(result.path.lower().endswith(ext) for ext in blocked_exts):
-            return (False, "This link points to an image or document. Please send a video or audio link.")
+            return (False, "This link points to a document or image. Please send a video or audio link.")
 
         hostname = result.hostname
         if not hostname:
@@ -556,7 +556,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "<b>1. Download Media</b>\n"
         "Send me any public video or audio link.\n\n"
         "<b>2. Smart Clipper (New!)</b>\n"
-        "Type /clip [link] 01:15-01:45 to save a specific part.\n\n"
+        "Type <code>/clip [link] 01:15-01:45</code> to save a specific part.\n\n"
         "<b>3. Inline Search (New!)</b>\n"
         "Type @Linko4UBot in ANY chat to find and share music.\n\n"
         "<b>4. Search & Trending</b>\n"
@@ -576,24 +576,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
-        "Linko Help Guide\n\n"
-        "How to use:\n"
-        "- Send a web link (YouTube, TikTok, Instagram Reels, etc.).\n"
-        "- Type /clip [link] [start]-[end] to cut parts.\n"
-        "- Type @Linko4UBot in any chat for inline search.\n"
-        "- Send a voice note or audio file to identify the song.\n"
-        "- Type /search [song name] or /trending.\n\n"
-        "Download Options:\n"
-        "- Standard Audio (MP3)\n"
-        "- Medium Audio (MP3)\n"
-        "- High Audio (MP3)\n"
-        "- Voice Message (OGG)\n"
-        "- Standard Video (MP4)\n\n"
-        "Read the English Guide: https://telegra.ph/Linko---User-Guide-10-17\n"
-        "မြန်မာလမ်းညွှန် ဖတ်ရန်: https://telegra.ph/Linko---User-Guide-MM-10-17\n\n"
-        "Limits: Max 30 minutes length, max 50 MB file size."
+        "<b>⚡ Linko Quick Help Guide</b>\n\n"
+        "<b>How to use:</b>\n"
+        "• Send any URL (YouTube, TikTok, Reels, etc.)\n"
+        "• <code>/clip [link] [start]-[end]</code> to trim media\n"
+        "• <code>@Linko4UBot [query]</code> in any chat for inline search\n"
+        "• Send a voice note/audio to identify the song\n"
+        "• <code>/search [song]</code> or <code>/trending</code>\n\n"
+        "<b>Quality Options:</b>\n"
+        "🎵 <b>Standard</b> (128kbps) | <b>Medium</b> (192kbps) | <b>High</b> (320kbps)\n"
+        "🎤 <b>Voice Note</b> (OGG) | 🎬 <b>Video</b> (MP4)\n\n"
+        "<b>📖 Detailed Guides:</b>\n"
+        "• <a href='https://telegra.ph/Linko---User-Guide-10-17'>Read the English Guide</a>\n"
+        "• <a href='https://telegra.ph/Linko---User-Guide-MM-10-17'>မြန်မာလမ်းညွှန် ဖတ်ရန်</a>\n\n"
+        "<i>Limits: Max 30 minutes length, max 50 MB file size limit.</i>"
     )
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(
+        help_text, 
+        parse_mode="HTML", 
+        disable_web_page_preview=True
+    )
 
 async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     quality_text = (
@@ -625,18 +627,25 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     terms_text = (
-        "Rules and Terms\n\n"
-        "1. Fair Use: Only download content you have permission to use, like public domain or Creative Commons media.\n"
-        "2. No Bypassing: Linko cannot access private accounts, paid subscriptions, or age-restricted content.\n"
-        "3. Privacy: All downloaded files are completely deleted from our servers immediately after they are sent to you."
+        "<b>⚖️ Linko Bot Terms of Service & Rules</b>\n\n"
+        "By using this bot, you explicitly agree to the following strict guidelines:\n\n"
+        "<b>1. Copyright & Fair Use</b>\n"
+        "You must only download content for which you hold the rights, or that is freely available under public domain/Creative Commons. You are solely responsible for how you use the downloaded media.\n\n"
+        "<b>2. Prohibited Content</b>\n"
+        "Attempting to bypass DRM, download age-restricted, adult, or illegal content, or accessing private accounts without authorization is strictly prohibited.\n\n"
+        "<b>3. Abuse & Rate Limits</b>\n"
+        "Spamming requests or exploiting the bot's queuing system will result in an automatic, permanent ban. The bot enforces strict rate limits to ensure fair access for all users.\n\n"
+        "<b>4. Privacy Guarantee</b>\n"
+        "Linko operates on a strict zero-retention policy. All processed audio and video files are permanently purged from our servers the exact millisecond they are delivered to your Telegram chat.\n\n"
+        "<i>Failure to adhere to these rules will result in immediate restriction from the bot.</i>"
     )
-    await update.message.reply_text(terms_text)
+    await update.message.reply_text(terms_text, parse_mode="HTML")
 
 async def send_donation_info(chat_id, context: ContextTypes.DEFAULT_TYPE) -> None:
     donate_caption = (
         "☕ Thank you so much for using Linko!\n\n"
         "If Linko has been helpful and made your downloads convenient, you can support "
-        "and buy me a coffee by scanning the KBZPay QR code below.\n\n"
+        "and buy me a coffee by scanning the KBZPay QR code above.\n\n"
         "Any amount is genuinely appreciated and helps keep the bot fast, stable, and running 24/7!"
     )
     
@@ -647,7 +656,9 @@ async def send_donation_info(chat_id, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as e:
             logger.error(f"Failed to send QR image from URL: {e}")
             
-    await context.bot.send_message(chat_id=chat_id, text=donate_caption)
+    # Fallback if no QR link is provided so the text still makes sense
+    fallback_caption = donate_caption.replace(" scanning the KBZPay QR code above", " supporting our project")
+    await context.bot.send_message(chat_id=chat_id, text=fallback_caption)
 
 async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_donation_info(update.effective_chat.id, context)
@@ -849,6 +860,12 @@ async def handle_audio_recognition(update: Update, context: ContextTypes.DEFAULT
         await msg.edit_text("Sorry, the song recognition failed.")
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
+
+async def handle_sticker_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.sticker:
+        await update.message.reply_sticker(update.message.sticker.file_id)
+    elif update.message.animation:
+        await update.message.reply_animation(update.message.animation.file_id)
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -1451,6 +1468,7 @@ def main() -> None:
     application.add_handler(CommandHandler("about", about_command))
     application.add_handler(InlineQueryHandler(inline_search))
     application.add_handler(CallbackQueryHandler(handle_callbacks))
+    application.add_handler(MessageHandler(filters.Sticker.ALL | filters.ANIMATION, handle_sticker_gif))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio_recognition))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO, handle_media))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link_message))
