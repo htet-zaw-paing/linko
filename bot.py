@@ -182,10 +182,10 @@ def get_groq_transcription(audio_path: str) -> str:
     with open(audio_path, "rb") as f:
         files = {"file": ("audio.ogg", f, "audio/ogg")}
         data = {"model": "whisper-large-v3", "response_format": "text"}
-        resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions", headers=headers, files=files, data=data, timeout=30)
+        resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions", headers=headers, files=files, data=data, timeout=60)
     
     if resp.status_code != 200:
-        raise ValueError(f"Transcription failed: {resp.text}")
+        raise ValueError(f"Groq API Error: {resp.text}")
     
     return resp.text.strip()
 
@@ -193,8 +193,7 @@ def get_groq_summary(text_content: str) -> str:
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is not configured. Please add it to the server environment variables.")
     
-    # Restrict to ~35000 characters to avoid token limits on the free API
-    truncated_text = text_content[:35000] 
+    truncated_text = text_content[:20000] 
     
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -214,25 +213,22 @@ def get_groq_summary(text_content: str) -> str:
         ],
         "temperature": 0.5
     }
-    resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
+    resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
     
     if resp.status_code != 200:
-        raise ValueError("Summarization failed. The API might be overloaded.")
+        raise ValueError(f"API Error ({resp.status_code}): {resp.text[:100]}...")
         
     return resp.json()["choices"][0]["message"]["content"].strip()
 
 # --- Advanced Compression ---
 def compress_video_to_50mb(input_path: str, output_path: str) -> None:
     try:
-        # Get duration
         cmd_dur = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_path]
         duration = float(subprocess.check_output(cmd_dur).decode('utf-8').strip())
         
-        # Target 45MB to be extremely safe for Telegram's strict limits
         target_size_bits = 45 * 1024 * 1024 * 8
         target_total_bitrate = int(target_size_bits / duration)
-        
-        target_video_bitrate = target_total_bitrate - 128000 # subtract audio overhead
+        target_video_bitrate = target_total_bitrate - 128000
         
         if target_video_bitrate < 50000:
             raise ValueError("Video is too long to compress under 50MB with viewable quality.")
@@ -242,8 +238,8 @@ def compress_video_to_50mb(input_path: str, output_path: str) -> None:
             '-b:v', str(target_video_bitrate),
             '-maxrate', str(target_video_bitrate * 1.5),
             '-bufsize', str(target_video_bitrate * 2),
-            '-preset', 'ultrafast', # Changed to ultrafast to save Render CPU
-            '-vf', 'scale=-2:480', # Scale down to 480p max to save bitrate and speed up conversion
+            '-preset', 'ultrafast',
+            '-vf', 'scale=-2:480',
             '-c:a', 'aac', '-b:a', '128k',
             output_path
         ]
@@ -512,7 +508,6 @@ def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None,
                                     raise InterruptedError("Process canceled by user.")
                                 f.write(chunk)
                     
-                    # Auto-Compression logic Check
                     if os.path.getsize(final_mp4) > 49.5 * 1024 * 1024:
                         comp_path = os.path.join(job_dir, "video_comp.mp4")
                         compress_video_to_50mb(final_mp4, comp_path)
@@ -534,7 +529,7 @@ def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None,
         "no_warnings": True,
         "geo_bypass": True,
         "nocheckcertificate": True,
-        "max_filesize": 100 * 1024 * 1024, # Let it download up to 100MB so we can try compressing it
+        "max_filesize": 100 * 1024 * 1024,
         "postprocessor_args": {"ffmpeg": ["-threads", "0"]},
         "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     }
@@ -545,7 +540,6 @@ def BlockingDownloadVideo(url: str, output_template: str, start_sec: int = None,
         
     _, title, uploader = run_ytdlp_with_fallback(ydl_opts, url, start_sec, end_sec, req_id)
     
-    # Auto-Compression logic Check after fallback download
     if os.path.exists(output_template) and os.path.getsize(output_template) > 49.5 * 1024 * 1024:
         comp_path = os.path.join(job_dir, "video_comp.mp4")
         compress_video_to_50mb(output_template, comp_path)
@@ -583,7 +577,6 @@ def build_audio_buttons(raw_title: str, uploader: str) -> tuple[InlineKeyboardMa
         search_str = clean_title
     search_str = search_str.strip()
     
-    # Ensure byte length is within Telegram limits
     search_bytes = search_str.encode('utf-8')
     if len(search_bytes) > 50:
         search_str = search_bytes[:50].decode('utf-8', errors='ignore')
@@ -692,8 +685,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• Send any URL (YouTube, TikTok, Reels, etc.)\n"
         "• <code>/clip [link] [start]-[end]</code> to trim media\n"
         "• <code>@Linko4UBot [query]</code> in any chat for inline search\n"
-        "• Send a voice note/audio to identify or transcribe it\n"
-        "• Reply to an audio file with <code>/edit Artist - Title</code> to edit tags\n"
+        "• Send a voice note/audio to identify the song\n"
         "• <code>/search [song]</code> or <code>/trending</code>\n\n"
         "<b>Quality Options:</b>\n"
         "🎵 <b>Standard</b> (128kbps) | <b>Medium</b> (192kbps) | <b>High</b> (320kbps)\n"
@@ -729,8 +721,9 @@ async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     about_text = (
         "<b>About Linko</b>\n\n"
-        "Linko is an all-in-one Telegram media suite designed to simplify downloading, smart clipping, AI transcription, and music discovery.\n\n"
-        "Powered by Python, yt-dlp, FFmpeg, ShazamIO, and Groq Llama/Whisper.\n\n"
+        "Linko is a streamlined Telegram utility designed to simplify media downloading and music discovery.\n\n"
+        "The bot allows users to save watermark-free videos, convert public web links into audio files, and identify playing music. It processes all requests directly within the chat and includes built-in features such as music search, trending charts, and lyrics retrieval.\n\n"
+        "To ensure reliable performance, the system is powered by Python, yt-dlp, FFmpeg, and ShazamIO.\n\n"
         "Developed and maintained by <a href='https://www.htetzawpaing.site'>Htet Zaw Paing</a>.\n"
         "A project by <a href='https://www.myancode.com'>MyanCode</a>."
     )
@@ -821,9 +814,11 @@ async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("⚠️ To edit tags, you must strictly REPLY to an existing AUDIO message with:\n`/edit Artist - Title`", parse_mode="Markdown")
         return
     
-    args_text = update.message.text.replace("/edit", "").strip()
+    message_text = update.message.text or update.message.caption or ""
+    args_text = message_text.replace("/edit", "").strip()
+    
     if "-" not in args_text:
-        await update.message.reply_text("⚠️ Please provide the new tags in the format:\n`/edit Artist Name - Song Title`", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Please provide the new tags in the format:\n`/edit Artist Name - Song Title`\n\n*(Make sure you reply directly to the audio!)*", parse_mode="Markdown")
         return
         
     artist, title = [x.strip() for x in args_text.split("-", 1)]
@@ -834,6 +829,11 @@ async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     os.makedirs(job_dir, exist_ok=True)
     
     try:
+        audio_file_size = update.message.reply_to_message.audio.file_size
+        if audio_file_size and audio_file_size > 20 * 1024 * 1024:
+            await status_msg.edit_text("⚠️ This audio file is too large (over 20MB) for the bot to edit directly due to Telegram limits.")
+            return
+
         orig_file = await context.bot.get_file(update.message.reply_to_message.audio.file_id)
         input_mp3 = os.path.join(job_dir, "input.mp3")
         output_mp3 = os.path.join(job_dir, "output.mp3")
@@ -1009,6 +1009,10 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def handle_audio_recognition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     file_obj = getattr(update.message, 'voice', None) or getattr(update.message, 'audio', None)
     if not file_obj:
+        return
+        
+    if file_obj.file_size and file_obj.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("⚠️ This file is too large (over 20MB) for AI recognition.")
         return
         
     req_id = str(uuid.uuid4())[:8]
@@ -1538,8 +1542,40 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             
             out = await shazam_engine.recognize(temp_path)
             track = out.get("track")
+            
             if not track:
-                await query.edit_message_text("Sorry, I couldn't identify this song.")
+                await query.edit_message_text("⚠️ Shazam didn't recognize this track (common for local Burmese songs).\n\n🤖 Let me try listening to the lyrics with AI...")
+                
+                transcription = await asyncio.to_thread(get_groq_transcription, temp_path)
+                if not transcription or len(transcription.strip()) < 3:
+                    await query.edit_message_text("⚠️ Sorry, I couldn't identify the song or hear the lyrics clearly.")
+                    return
+                
+                search_query = transcription[:100].replace('\n', ' ')
+                
+                def do_fallback_search():
+                    opts = {"quiet": True, "extract_flat": True, "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios"]}}}
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        return ydl.extract_info(f"ytsearch5:{search_query}", download=False)
+                
+                info = await asyncio.to_thread(do_fallback_search)
+                entries = info.get("entries", [])
+                
+                if not entries:
+                    await query.edit_message_text(f"📝 I heard: _{search_query}_\n\n⚠️ But no matches were found on YouTube for those lyrics.", parse_mode="Markdown")
+                    return
+                
+                if "links" not in context.user_data:
+                    context.user_data["links"] = {}
+                keyboard = []
+                for i, entry in enumerate(entries, 1):
+                    t_title = entry.get("title", "Unknown")[:40]
+                    t_req_id = str(uuid.uuid4())[:8]
+                    context.user_data["links"][t_req_id] = entry.get("url")
+                    keyboard.append([InlineKeyboardButton(f"{i}. {t_title}", callback_data=f"askq|{t_req_id}")])
+                
+                keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel|000")])
+                await query.edit_message_text(f"🎵 **AI Lyric Search Results:**\n_{search_query}_", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
                 return
             
             title = track.get("title", "Unknown Title")
@@ -1555,6 +1591,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
             ]
             await query.edit_message_text(f"🎵 Song Found!\nTitle: {title}\nArtist: {artist}\n\nSelect an option below:", reply_markup=InlineKeyboardMarkup(keyboard))
+            
         except Exception:
             await query.edit_message_text("Sorry, the song recognition failed.")
         finally:
@@ -1582,8 +1619,8 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(f"📝 **Transcription:**\n\n{transcription}", parse_mode="Markdown")
         except ValueError as ve:
             await query.edit_message_text(f"⚠️ {ve}")
-        except Exception:
-            await query.edit_message_text("⚠️ Transcription failed due to an unexpected error.")
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Transcription failed: {str(e)[:100]}")
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
         return
@@ -1602,19 +1639,26 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             def fetch_subs():
                 opts = {
                     "skip_download": True,
+                    "writesubtitles": True,
                     "writeautomaticsub": True,
-                    "subtitleslangs": ["en"],
+                    "subtitleslangs": ["en", "en-US", "en-GB"],
+                    "subtitlesformat": "vtt",
                     "outtmpl": os.path.join(job_dir, "video"),
                     "quiet": True
                 }
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.extract_info(url, download=True)
                 
-            await asyncio.to_thread(fetch_subs)
+            try:
+                await asyncio.to_thread(fetch_subs)
+            except Exception as yt_err:
+                await query.edit_message_text(f"⚠️ Failed to extract captions. Video might be restricted.\n`{str(yt_err)[:50]}`", parse_mode="Markdown")
+                return
+
             vtt_file = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.vtt')), None)
             
             if not vtt_file:
-                await query.edit_message_text("⚠️ No English auto-captions were found for this video. The AI cannot summarize it.")
+                await query.edit_message_text("⚠️ No English captions were found for this video. The AI cannot summarize it.")
                 return
                 
             with open(vtt_file, "r", encoding="utf-8") as f:
@@ -1628,8 +1672,8 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(f"📋 **AI Video Summary:**\n\n{summary}", parse_mode="Markdown")
         except ValueError as ve:
             await query.edit_message_text(f"⚠️ {ve}")
-        except Exception:
-            await query.edit_message_text("⚠️ Summarization failed.")
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Summarization failed: {str(e)[:100]}")
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
         return
@@ -1798,6 +1842,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Sticker.ALL | filters.ANIMATION, handle_sticker_gif))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio_recognition))
     
+    # Message handlers setup for tags & media
     application.add_handler(MessageHandler(filters.PHOTO & filters.REPLY & filters.CaptionRegex(r"^/edit"), edit_tags_command))
     application.add_handler(MessageHandler(filters.Document.ALL | (filters.PHOTO & ~filters.REPLY) | filters.VIDEO, handle_media))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link_message))
