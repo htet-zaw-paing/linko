@@ -171,22 +171,64 @@ def parse_time_to_seconds(t_str: str) -> int:
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     return int(t_str)
 
-def get_groq_transcription(audio_path: str) -> str:
+def get_groq_transcription(audio_path: str, as_srt: bool = False) -> str:
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is not configured.")
     if os.path.getsize(audio_path) > 25 * 1024 * 1024:
         raise ValueError("File is too large for AI transcription (Max 25 MB).")
         
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    resp_format = "srt" if as_srt else "text"
     with open(audio_path, "rb") as f:
         files = {"file": ("audio.ogg", f, "audio/ogg")}
-        data = {"model": "whisper-large-v3", "response_format": "text"}
+        data = {"model": "whisper-large-v3", "response_format": resp_format}
         resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions", headers=headers, files=files, data=data, timeout=60)
     
     if resp.status_code != 200:
         raise ValueError(f"API Error: {resp.text}")
     
     return resp.text.strip()
+
+def get_groq_completion(system_prompt: str, user_text: str) -> str:
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY is not configured.")
+    
+    truncated_text = user_text[:20000] 
+    
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama3-8b-8192",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": truncated_text}
+        ],
+        "temperature": 0.5
+    }
+    resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
+    
+    if resp.status_code != 200:
+        raise ValueError(f"API Error ({resp.status_code}): {resp.text[:100]}...")
+        
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+def analyze_audio_bpm_key(audio_path: str) -> str:
+    try:
+        import librosa
+        import numpy as np
+    except ImportError:
+        raise ValueError("The 'librosa' library is not installed on the server.")
+        
+    y, sr = librosa.load(audio_path, sr=22050, duration=60)
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+    keys = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    key_idx = np.argmax(np.sum(chroma, axis=1))
+    
+    t_val = tempo[0] if isinstance(tempo, np.ndarray) else tempo
+    return f"{round(float(t_val))} BPM • {keys[key_idx]}"
 
 def compress_video_to_50mb(input_path: str, output_path: str) -> None:
     try:
@@ -573,6 +615,7 @@ async def post_init(application) -> None:
         BotCommand("search", "Search for songs"),
         BotCommand("clip", "Clip specific audio/video parts"),
         BotCommand("trending", "See top trending songs"),
+        BotCommand("podcast", "Convert text to speech"),
         BotCommand("help", "Learn how to use the bot"),
         BotCommand("quality", "See audio quality options"),
         BotCommand("donate", "Support Linko"),
@@ -634,9 +677,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Type <code>/clip [link] 01:15-01:45</code> to save a specific part.\n\n"
         "<b>3. Inline Search (New!)</b>\n"
         "Type @Linko4UBot in ANY chat to find and share music.\n\n"
-        "<b>4. Search & Trending</b>\n"
+        "<b>4. Podcast Generator (New!)</b>\n"
+        "Type <code>/podcast [your long text here]</code> to turn it into an audio file.\n\n"
+        "<b>5. Search & Trending</b>\n"
         "Type /search [song name] or /trending.\n\n"
-        "<b>5. Identify & Transcribe</b>\n"
+        "<b>6. Identify & Transcribe</b>\n"
         "Forward a voice note to Shazam it or transcribe it to text.\n\n"
         "<b>Guides:</b>\n"
         "• <a href='https://telegra.ph/Linko---User-Guide-10-17'>Read the English Guide</a>\n"
@@ -653,10 +698,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     help_text = (
         "<b>⚡ Linko Quick Help Guide</b>\n\n"
         "<b>How to use:</b>\n"
-        "• Send any URL (YouTube, TikTok, Reels, etc.)\n"
+        "• Send any URL (YouTube, TikTok, Reels, Spotify, Apple Music)\n"
         "• <code>/clip [link] [start]-[end]</code> to trim media\n"
+        "• <code>/podcast [text]</code> to generate realistic audio from text\n"
         "• <code>@Linko4UBot [query]</code> in any chat for inline search\n"
-        "• Send a voice note/audio to identify the song\n"
+        "• Send a voice note/audio to identify, transcribe, translate, or polish\n"
+        "• Send a video file to extract audio or generate subtitles\n"
+        "• Reply to an audio file with <code>/edit Artist - Title</code> to edit tags\n"
         "• <code>/search [song]</code> or <code>/trending</code>\n\n"
         "<b>Quality Options:</b>\n"
         "🎵 <b>Standard</b> (128kbps) | <b>Medium</b> (192kbps) | <b>High</b> (320kbps)\n"
@@ -779,6 +827,41 @@ async def clip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         [InlineKeyboardButton("🎬 Clip Video (MP4)", callback_data=f"dlvc|{req_id}")]
     ]
     await update.message.reply_text(f"✂️ Clipping from {start_str} to {end_str}.\nChoose format:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def podcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = " ".join(context.args)
+    if not text and update.message.reply_to_message and update.message.reply_to_message.text:
+        text = update.message.reply_to_message.text
+        
+    if not text:
+        await update.message.reply_text("🎙️ Please provide text to convert to a podcast.\nUsage: `/podcast [your text here]` or reply to a text message.", parse_mode="Markdown")
+        return
+        
+    if len(text) > 10000:
+        await update.message.reply_text("⚠️ The text is too long. Please keep it under 10,000 characters.")
+        return
+        
+    req_id = str(uuid.uuid4())[:8]
+    status_msg = await update.message.reply_text("🎙️ Generating ultra-realistic podcast audio...")
+    job_dir = os.path.join(DOWNLOAD_DIR, req_id)
+    os.makedirs(job_dir, exist_ok=True)
+    out_mp3 = os.path.join(job_dir, "podcast.mp3")
+    
+    try:
+        def run_tts():
+            subprocess.run(["edge-tts", "--text", text, "--write-media", out_mp3], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.to_thread(run_tts)
+        
+        await status_msg.edit_text("⚡ Uploading podcast to Telegram...")
+        with open(out_mp3, "rb") as af:
+            await context.bot.send_audio(chat_id=update.effective_chat.id, audio=af, title="Linko Podcast", performer="AI Voice", read_timeout=120, write_timeout=120)
+        await status_msg.delete()
+    except FileNotFoundError:
+        await status_msg.edit_text("⚠️ The 'edge-tts' library is not installed on the server. Please tell the admin to install it.")
+    except Exception as e:
+        await status_msg.edit_text(f"⚠️ Failed to generate podcast: {str(e)[:100]}")
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message.reply_to_message or not update.message.reply_to_message.audio:
@@ -998,18 +1081,47 @@ async def handle_audio_recognition(update: Update, context: ContextTypes.DEFAULT
         return
         
     if file_obj.file_size and file_obj.file_size > 20 * 1024 * 1024:
-        await update.message.reply_text("⚠️ This file is too large (over 20MB) for AI recognition.")
+        await update.message.reply_text("⚠️ This file is too large (over 20MB) for processing.")
         return
         
     req_id = str(uuid.uuid4())[:8]
     GLOBAL_SESSION[req_id] = {"file_id": file_obj.file_id}
     
     keyboard = [
-        [InlineKeyboardButton("🎵 Identify Song (Shazam)", callback_data=f"shazam|{req_id}")],
-        [InlineKeyboardButton("📝 Transcribe to Text (AI)", callback_data=f"transcribe|{req_id}")],
+        [
+            InlineKeyboardButton("🎵 Shazam", callback_data=f"shazam|{req_id}"),
+            InlineKeyboardButton("🎹 Analyze Beat", callback_data=f"analyze|{req_id}")
+        ],
+        [
+            InlineKeyboardButton("📝 Transcribe", callback_data=f"transcribe|{req_id}"),
+            InlineKeyboardButton("🌍 Translate", callback_data=f"translate|{req_id}")
+        ],
+        [
+            InlineKeyboardButton("✨ Polish Audio", callback_data=f"polish|{req_id}"),
+            InlineKeyboardButton("🎓 Study Guide", callback_data=f"study|{req_id}")
+        ],
         [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
     ]
-    await update.message.reply_text("🎧 Audio received! What would you like to do?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🎧 Audio received! Choose an advanced action:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def handle_video_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    file_obj = update.message.video or update.message.document
+    if not file_obj:
+        return
+        
+    if file_obj.file_size and file_obj.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("⚠️ This video is too large (over 20MB) for direct bot processing.")
+        return
+        
+    req_id = str(uuid.uuid4())[:8]
+    GLOBAL_SESSION[req_id] = {"file_id": file_obj.file_id}
+    
+    keyboard = [
+        [InlineKeyboardButton("🎵 Extract Audio", callback_data=f"extract|{req_id}")],
+        [InlineKeyboardButton("📝 Generate Subtitles (SRT)", callback_data=f"srt|{req_id}")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
+    ]
+    await update.message.reply_text("🎬 Video received! What would you like to do?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_sticker_gif(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.sticker:
@@ -1017,10 +1129,9 @@ async def handle_sticker_gif(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif update.message.animation:
         await update.message.reply_animation(update.message.animation.file_id)
 
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_media_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Linko only works with links and audio files. Please do not send images or documents for privacy reasons.\n\n"
-        "Send a media link or use /search to begin."
+        "Linko works directly with links, audio files, and video files under 20MB.\n\nSend a media link or use /search to begin."
     )
 
 async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1051,6 +1162,22 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Error: {error_reason}")
         return
         
+    if "spotify.com" in message_text.lower() or "music.apple.com" in message_text.lower():
+        msg = await update.message.reply_text("🎵 Converting streaming link to universal audio...")
+        try:
+            r = await asyncio.to_thread(requests.get, message_text, timeout=5)
+            title_match = re.search(r'<title>(.*?)</title>', r.text)
+            if title_match:
+                clean_title = title_match.group(1).replace(" | Spotify", "").replace(" - song and lyrics by ", " ").replace(" on Apple Music", "")
+                message_text = f"ytsearch1:{clean_title}"
+            else:
+                await msg.edit_text("⚠️ Could not read the track name from that link.")
+                return
+        except Exception:
+            await msg.edit_text("⚠️ Failed to parse streaming link.")
+            return
+        await msg.delete()
+        
     request_id = str(uuid.uuid4())[:8]
     if "links" not in context.user_data:
         context.user_data["links"] = {}
@@ -1058,7 +1185,10 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     keyboard = []
     
-    if any(d in message_text.lower() for d in ["tiktok.com", "instagram.com/reel", "youtube.com/shorts", "youtu.be"]):
+    if "youtube.com" in message_text.lower() or "youtu.be" in message_text.lower():
+        keyboard.append([InlineKeyboardButton("📋 Summarize Video (AI)", callback_data=f"summary|{request_id}")])
+
+    if not message_text.startswith("ytsearch1:") and any(d in message_text.lower() for d in ["tiktok.com", "instagram.com/reel", "youtube.com/shorts", "youtu.be"]):
         keyboard.append([InlineKeyboardButton("🎬 Standard Video (MP4)", callback_data=f"dlv|{request_id}")])
         
     if "list=" in message_text or "/playlist" in message_text or "/album/" in message_text:
@@ -1508,6 +1638,174 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.send_message(update.effective_chat.id, "Sorry, no lyrics found for this song.")
         return
 
+    if data.startswith("analyze|"):
+        req_id = data.split("|")[1]
+        session = GLOBAL_SESSION.pop(req_id, None)
+        if not session:
+            await query.edit_message_text("Session expired. Please send the audio again.")
+            return
+            
+        await query.edit_message_text("🎹 Analyzing BPM and Musical Key...")
+        job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
+        os.makedirs(job_dir, exist_ok=True)
+        try:
+            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
+            temp_path = os.path.join(job_dir, "input_audio.oga")
+            await tg_file.download_to_drive(temp_path)
+            
+            result = await asyncio.to_thread(analyze_audio_bpm_key, temp_path)
+            await query.edit_message_text(f"🎹 **Audio Analysis:**\n\n{result}", parse_mode="Markdown")
+        except ValueError as ve:
+            await query.edit_message_text(f"⚠️ {ve}")
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Analysis failed: {str(e)[:100]}")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return
+
+    if data.startswith("polish|"):
+        req_id = data.split("|")[1]
+        session = GLOBAL_SESSION.pop(req_id, None)
+        if not session:
+            await query.edit_message_text("Session expired. Please send the audio again.")
+            return
+            
+        await query.edit_message_text("✨ Polishing audio... Enhancing volume and reducing noise.")
+        job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
+        os.makedirs(job_dir, exist_ok=True)
+        try:
+            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
+            temp_path = os.path.join(job_dir, "input_audio.oga")
+            out_path = os.path.join(job_dir, "polished.mp3")
+            await tg_file.download_to_drive(temp_path)
+            
+            def run_polish():
+                cmd = ['ffmpeg', '-y', '-i', temp_path, '-af', 'afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11', '-c:a', 'libmp3lame', '-b:a', '192k', out_path]
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            await asyncio.to_thread(run_polish)
+            
+            await query.edit_message_text("⚡ Uploading polished audio...")
+            with open(out_path, "rb") as af:
+                await context.bot.send_audio(chat_id=update.effective_chat.id, audio=af, title="Polished Audio", performer="Linko Studio", read_timeout=120, write_timeout=120)
+            await query.message.delete()
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Polish failed: {str(e)[:100]}")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return
+
+    if data.startswith("study|") or data.startswith("translate|"):
+        req_id = data.split("|")[1]
+        action = data.split("|")[0]
+        session = GLOBAL_SESSION.pop(req_id, None)
+        if not session:
+            await query.edit_message_text("Session expired. Please send the audio again.")
+            return
+            
+        await query.edit_message_text("📝 AI is listening to the audio...")
+        job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
+        os.makedirs(job_dir, exist_ok=True)
+        try:
+            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
+            temp_path = os.path.join(job_dir, "input_audio.oga")
+            await tg_file.download_to_drive(temp_path)
+            
+            transcription = await asyncio.to_thread(get_groq_transcription, temp_path)
+            if not transcription or len(transcription.strip()) < 5:
+                await query.edit_message_text("⚠️ Could not hear enough speech to process.")
+                return
+                
+            await query.edit_message_text("🧠 AI is analyzing the text...")
+            
+            if action == "study":
+                prompt = "Convert the following transcript into a structured Study Guide syllabus with key takeaways. Then, create 5 multiple-choice flashcard questions at the end to test the reader's knowledge."
+            else:
+                prompt = "Translate the following text accurately into English, Burmese, and Japanese. Format it clearly with headings for each language."
+                
+            result = await asyncio.to_thread(get_groq_completion, prompt, transcription)
+            if len(result) > 4000:
+                result = result[:4000] + "...\n(Truncated due to limits)"
+            await query.edit_message_text(result, parse_mode="Markdown")
+        except ValueError as ve:
+            await query.edit_message_text(f"⚠️ {ve}")
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Process failed: {str(e)[:100]}")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return
+
+    if data.startswith("extract|"):
+        req_id = data.split("|")[1]
+        session = GLOBAL_SESSION.pop(req_id, None)
+        if not session:
+            await query.edit_message_text("Session expired. Please send the video again.")
+            return
+            
+        await query.edit_message_text("🎵 Extracting audio track...")
+        job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
+        os.makedirs(job_dir, exist_ok=True)
+        try:
+            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
+            temp_path = os.path.join(job_dir, "input_video.mp4")
+            out_path = os.path.join(job_dir, "extracted_audio.mp3")
+            await tg_file.download_to_drive(temp_path)
+            
+            def run_extract():
+                subprocess.run(['ffmpeg', '-y', '-i', temp_path, '-q:a', '0', '-map', 'a', out_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+            await asyncio.to_thread(run_extract)
+            
+            await query.edit_message_text("⚡ Uploading extracted audio...")
+            with open(out_path, "rb") as af:
+                await context.bot.send_audio(chat_id=update.effective_chat.id, audio=af, title="Extracted Audio", performer="Linko", read_timeout=120, write_timeout=120)
+            await query.message.delete()
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Extraction failed: {str(e)[:100]}")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return
+
+    if data.startswith("srt|"):
+        req_id = data.split("|")[1]
+        session = GLOBAL_SESSION.pop(req_id, None)
+        if not session:
+            await query.edit_message_text("Session expired. Please send the video again.")
+            return
+            
+        await query.edit_message_text("📝 Preparing video audio for AI transcription...")
+        job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
+        os.makedirs(job_dir, exist_ok=True)
+        try:
+            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
+            temp_path = os.path.join(job_dir, "input_video.mp4")
+            audio_path = os.path.join(job_dir, "temp_audio.ogg")
+            srt_path = os.path.join(job_dir, "subtitles.srt")
+            await tg_file.download_to_drive(temp_path)
+            
+            def extract_ogg():
+                subprocess.run(['ffmpeg', '-y', '-i', temp_path, '-vn', '-c:a', 'libopus', '-b:a', '32k', audio_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+            await asyncio.to_thread(extract_ogg)
+            
+            await query.edit_message_text("📝 AI is generating perfectly synced subtitles...")
+            srt_text = await asyncio.to_thread(get_groq_transcription, audio_path, True)
+            
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(srt_text)
+                
+            await query.edit_message_text("⚡ Uploading subtitle file...")
+            with open(srt_path, "rb") as doc:
+                await context.bot.send_document(chat_id=update.effective_chat.id, document=doc, filename="subtitles.srt", caption="📝 Auto-Generated Subtitles", read_timeout=120, write_timeout=120)
+            await query.message.delete()
+        except ValueError as ve:
+            await query.edit_message_text(f"⚠️ {ve}")
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Subtitle generation failed: {str(e)[:100]}")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return
+
     if data.startswith("shazam|"):
         req_id = data.split("|")[1]
         session = GLOBAL_SESSION.pop(req_id, None)
@@ -1604,6 +1902,90 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text(f"⚠️ {ve}")
         except Exception as e:
             await query.edit_message_text(f"⚠️ Transcription failed: {str(e)[:100]}")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return
+        
+    if data.startswith("summary|"):
+        req_id = data.split("|")[1]
+        url = context.user_data.get("links", {}).get(req_id, None)
+        if not url:
+            await query.edit_message_text("Session expired. Please send the link again.")
+            return
+            
+        await query.edit_message_text("📋 Fetching video transcript for AI summarization...")
+        job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
+        os.makedirs(job_dir, exist_ok=True)
+        try:
+            def fetch_subs():
+                opts = {
+                    "skip_download": True,
+                    "quiet": True,
+                    "extractor_args": {"youtube": {"player_client": ["web", "tv_embedded", "ios"]}}
+                }
+                if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
+                    opts["cookiefile"] = COOKIES_FILE_PATH
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, download=False)
+                    
+            info = await asyncio.to_thread(fetch_subs)
+            
+            sub_url = None
+            for sub_type in ['subtitles', 'automatic_captions']:
+                if sub_url:
+                    break
+                sub_data = info.get(sub_type, {})
+                for lang, formats in sub_data.items():
+                    if formats:
+                        for f in formats:
+                            if f.get('ext') == 'json3':
+                                sub_url = f.get('url')
+                                break
+                        if not sub_url:
+                            sub_url = formats[0].get('url')
+                        break
+            
+            if not sub_url:
+                await query.edit_message_text("⚠️ No subtitles found. Downloading raw audio for AI Fallback summarization...")
+                audio_path = os.path.join(job_dir, "temp.mp3")
+                def fetch_worst_audio():
+                    opts = {"format": "worstaudio", "outtmpl": audio_path, "max_filesize": 25 * 1024 * 1024, "quiet": True}
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        ydl.download([url])
+                await asyncio.to_thread(fetch_worst_audio)
+                
+                await query.edit_message_text("📝 Transcribing video audio for summarization...")
+                clean_text = await asyncio.to_thread(get_groq_transcription, audio_path)
+            else:
+                resp = await asyncio.to_thread(requests.get, sub_url, timeout=10)
+                if 'json3' in sub_url:
+                    data_json = resp.json()
+                    events = data_json.get('events', [])
+                    text_parts = []
+                    for ev in events:
+                        if 'segs' in ev:
+                            for seg in ev['segs']:
+                                if 'utf8' in seg:
+                                    text_parts.append(seg['utf8'])
+                    clean_text = "".join(text_parts).replace('\n', ' ').strip()
+                else:
+                    raw_text = resp.text
+                    clean_text = re.sub(r'<[^>]+>', ' ', raw_text)
+                    clean_text = re.sub(r'&\w+;', ' ', clean_text)
+                    clean_text = re.sub(r'\n+', ' ', clean_text).strip()
+                
+            if not clean_text or len(clean_text) < 10:
+                await query.edit_message_text("⚠️ Could not extract readable content from this video.")
+                return
+                
+            await query.edit_message_text("📋 AI is analyzing the video content...")
+            summary = await asyncio.to_thread(get_groq_summary, clean_text)
+            await query.edit_message_text(f"📋 **AI Video Summary:**\n\n{summary}", parse_mode="Markdown")
+            
+        except ValueError as ve:
+            await query.edit_message_text(f"⚠️ {ve}")
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Summarization failed: {str(e)[:100]}")
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
         return
@@ -1769,13 +2151,14 @@ def main() -> None:
     application.add_handler(CommandHandler("terms", terms_command))
     application.add_handler(CommandHandler("about", about_command))
     application.add_handler(CommandHandler("edit", edit_tags_command))
+    application.add_handler(CommandHandler("podcast", podcast_command))
     application.add_handler(InlineQueryHandler(inline_search))
     application.add_handler(CallbackQueryHandler(handle_callbacks))
     application.add_handler(MessageHandler(filters.Sticker.ALL | filters.ANIMATION, handle_sticker_gif))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio_recognition))
+    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, handle_video_file))
     
     application.add_handler(MessageHandler(filters.PHOTO & filters.REPLY & filters.CaptionRegex(r"^/edit"), edit_tags_command))
-    application.add_handler(MessageHandler(filters.Document.ALL | (filters.PHOTO & ~filters.REPLY) | filters.VIDEO, handle_media))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link_message))
     
     application.run_polling(drop_pending_updates=True)
