@@ -171,17 +171,16 @@ def parse_time_to_seconds(t_str: str) -> int:
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     return int(t_str)
 
-def get_groq_transcription(audio_path: str, as_srt: bool = False) -> str:
+def get_groq_transcription(audio_path: str) -> str:
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is not configured.")
     if os.path.getsize(audio_path) > 25 * 1024 * 1024:
         raise ValueError("File is too large for AI transcription (Max 25 MB).")
         
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    resp_format = "srt" if as_srt else "text"
     with open(audio_path, "rb") as f:
         files = {"file": ("audio.ogg", f, "audio/ogg")}
-        data = {"model": "whisper-large-v3", "response_format": resp_format}
+        data = {"model": "whisper-large-v3", "response_format": "text"}
         resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions", headers=headers, files=files, data=data, timeout=60)
     
     if resp.status_code != 200:
@@ -189,11 +188,11 @@ def get_groq_transcription(audio_path: str, as_srt: bool = False) -> str:
     
     return resp.text.strip()
 
-def get_groq_completion(system_prompt: str, user_text: str) -> str:
+def get_groq_summary(text_content: str) -> str:
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is not configured.")
     
-    truncated_text = user_text[:20000] 
+    truncated_text = text_content[:20000] 
     
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -202,8 +201,14 @@ def get_groq_completion(system_prompt: str, user_text: str) -> str:
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": truncated_text}
+            {
+                "role": "system", 
+                "content": "You are an assistant that summarizes video transcripts. Provide a clear, concise 5-bullet-point summary of the main topics discussed. Do not add conversational filler, just return the bullet points."
+            },
+            {
+                "role": "user", 
+                "content": truncated_text
+            }
         ],
         "temperature": 0.5
     }
@@ -213,22 +218,6 @@ def get_groq_completion(system_prompt: str, user_text: str) -> str:
         raise ValueError(f"API Error ({resp.status_code}): {resp.text[:100]}...")
         
     return resp.json()["choices"][0]["message"]["content"].strip()
-
-def analyze_audio_bpm_key(audio_path: str) -> str:
-    try:
-        import librosa
-        import numpy as np
-    except ImportError:
-        raise ValueError("The 'librosa' library is not installed on the server.")
-        
-    y, sr = librosa.load(audio_path, sr=22050, duration=15)
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-    keys = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-    key_idx = np.argmax(np.sum(chroma, axis=1))
-    
-    t_val = tempo[0] if isinstance(tempo, np.ndarray) else tempo
-    return f"{round(float(t_val))} BPM • {keys[key_idx]}"
 
 def compress_video_to_50mb(input_path: str, output_path: str) -> None:
     try:
@@ -574,7 +563,7 @@ def explain_download_error(error: Exception) -> str:
         return "The requested file is larger than 100 MB and cannot be safely compressed to meet Telegram limits."
     if "ffmpeg" in message or "ffprobe" in message or "postprocessing" in message:
         return "The audio conversion failed. The file format might not be supported."
-    return "Could not process the media. Make sure the link is public and valid."
+    return "Could not download the media. Make sure the link is public and valid."
 
 def build_audio_buttons(raw_title: str, uploader: str) -> tuple[InlineKeyboardMarkup, str]:
     uploader_clean = uploader.replace(' - Topic', '')
@@ -658,7 +647,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     await asyncio.wait_for(execute_download(update.effective_chat.id, url, quality_key, context, status_msg, "", req_id=req_id), timeout=PROCESS_TIMEOUT)
             except (asyncio.TimeoutError, TimeoutError):
                 GLOBAL_CANCEL_FLAGS.add(req_id)
-                await context.bot.send_message(update.effective_chat.id, "⏳ Process timed out. Please try again.")
+                await context.bot.send_message(update.effective_chat.id, "⏳ The request took too long and was automatically canceled. Please try again.")
             except InterruptedError:
                 pass 
             finally:
@@ -669,28 +658,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     user_first_name = update.effective_user.first_name or "there"
     welcome_text = (
-        f"<b>Welcome to Linko, {user_first_name}!</b> ⚡\n\n"
-        "Here is what I can do:\n\n"
-        "<b>1. Download Media</b>\n"
-        "Send me any public video or audio link.\n\n"
-        "<b>2. Smart Clipper</b>\n"
-        "Type <code>/clip [link] 01:15-01:45</code> to save a specific part.\n\n"
-        "<b>3. Inline Search</b>\n"
-        "Type @Linko4UBot in ANY chat to find and share music.\n\n"
-        "<b>4. Podcast Generator</b>\n"
-        "Type <code>/podcast [your long text here]</code> to turn it into an audio file.\n\n"
-        "<b>5. Search & Trending</b>\n"
-        "Type /search [song name] or /trending.\n\n"
-        "<b>6. Identify & Transcribe</b>\n"
-        "Forward a voice note to Shazam it or transcribe it to text.\n\n"
-        "<b>Guides:</b>\n"
-        "• <a href='https://telegra.ph/Linko---User-Guide-10-17'>Read the English Guide</a>\n"
-        "• <a href='https://telegra.ph/Linko---User-Guide-MM-10-17'>မြန်မာလမ်းညွှန် ဖတ်ရန်</a>\n\n"
-        "<i>By using Linko, you agree to our /terms.</i>"
+        f"Hi {user_first_name}! 👋 Welcome to Linko.\n\n"
+        "I'm your all-in-one media assistant. Here is what I can do:\n\n"
+        "📥 *Download Media:* Send any YouTube, TikTok, IG, or Spotify link.\n"
+        "✂️ *Smart Clip:* `/clip [link] [start]-[end]` (e.g., /clip link 01:00-01:30)\n"
+        "🎙️ *Podcast TTS:* `/podcast [text]` to turn text into realistic speech.\n"
+        "🔍 *Search Music:* `/search [song name]` or use `@Linko4UBot` in any chat.\n"
+        "🔥 *Trending:* `/trending` to see global top hits.\n"
+        "🎧 *Voice/Audio Tools:* Send a voice note or audio file to Shazam, Transcribe, or Polish it.\n"
+        "🎬 *Video Tools:* Send a short video to extract its audio.\n"
+        "🏷️ *Edit Tags:* Reply to any audio with `/edit Artist - Title` (attach a photo for cover art).\n"
+        "📋 *AI Summary:* Send a YouTube link and click 'Summarize Video'.\n\n"
+        "Need help? Just send `/help`."
     )
     await update.message.reply_text(
         welcome_text, 
-        parse_mode="HTML", 
+        parse_mode="Markdown", 
         disable_web_page_preview=True
     )
 
@@ -702,8 +685,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• <code>/clip [link] [start]-[end]</code> to trim media\n"
         "• <code>/podcast [text]</code> to generate realistic audio from text\n"
         "• <code>@Linko4UBot [query]</code> in any chat for inline search\n"
-        "• Send a voice note/audio to identify, transcribe, translate, or polish\n"
-        "• Send a video file to extract audio or generate subtitles\n"
+        "• Send a voice note/audio to identify, transcribe, or polish\n"
+        "• Send a video file to extract audio\n"
         "• Reply to an audio file with <code>/edit Artist - Title</code> to edit tags\n"
         "• <code>/search [song]</code> or <code>/trending</code>\n\n"
         "<b>Quality Options:</b>\n"
@@ -848,15 +831,18 @@ async def podcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
     req_id = str(uuid.uuid4())[:8]
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel Processing", callback_data=f"abort|{req_id}")]])
-    status_msg = await update.message.reply_text("🎙️ Generating podcast audio... \n(Note: Mixed Burmese/English may pronounce incorrectly)", reply_markup=cancel_kb)
+    status_msg = await update.message.reply_text("🎙️ Generating podcast audio...", reply_markup=cancel_kb)
     job_dir = os.path.join(DOWNLOAD_DIR, req_id)
     os.makedirs(job_dir, exist_ok=True)
     out_mp3 = os.path.join(job_dir, "podcast.mp3")
     
     user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
     try:
+        has_burmese = bool(re.search(r'[\u1000-\u109F]', text))
+        voice = "my-MM-NilarNeural" if has_burmese else "en-US-AriaNeural"
+        
         def run_tts():
-            subprocess.run(["edge-tts", "--text", text, "--write-media", out_mp3], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["edge-tts", "--voice", voice, "--text", text, "--write-media", out_mp3], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         await asyncio.wait_for(asyncio.to_thread(run_tts), timeout=PROCESS_TIMEOUT)
         if req_id in GLOBAL_CANCEL_FLAGS:
@@ -1107,17 +1093,12 @@ async def handle_audio_recognition(update: Update, context: ContextTypes.DEFAULT
     keyboard = [
         [
             InlineKeyboardButton("🎵 Shazam", callback_data=f"shazam|{req_id}"),
-            InlineKeyboardButton("🎹 Analyze Beat", callback_data=f"analyze|{req_id}")
-        ],
-        [
-            InlineKeyboardButton("📝 Transcribe", callback_data=f"transcribe|{req_id}"),
-            InlineKeyboardButton("🌍 Translate", callback_data=f"translate|{req_id}")
+            InlineKeyboardButton("📝 Transcribe", callback_data=f"transcribe|{req_id}")
         ],
         [
             InlineKeyboardButton("✨ Polish Audio", callback_data=f"polish|{req_id}"),
-            InlineKeyboardButton("🎓 Study Guide", callback_data=f"study|{req_id}")
-        ],
-        [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
+            InlineKeyboardButton("Cancel", callback_data="cancel|000")
+        ]
     ]
     await update.message.reply_text("🎧 Audio received! Choose an advanced action:", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -1135,7 +1116,6 @@ async def handle_video_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     keyboard = [
         [InlineKeyboardButton("🎵 Extract Audio", callback_data=f"extract|{req_id}")],
-        [InlineKeyboardButton("📝 Generate Subtitles (SRT)", callback_data=f"srt|{req_id}")],
         [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
     ]
     await update.message.reply_text("🎬 Video received! What would you like to do?", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1179,6 +1159,34 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Error: {error_reason}")
         return
         
+    if "spotify.com" in message_text.lower() or "music.apple.com" in message_text.lower():
+        msg = await update.message.reply_text("🎵 Converting streaming link to universal format...")
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"}
+            r = await asyncio.to_thread(requests.get, message_text, headers=headers, timeout=10)
+            
+            og_title_match = re.search(r'<meta property="og:title" content="(.*?)"', r.text)
+            title_match = re.search(r'<title>(.*?)</title>', r.text, re.IGNORECASE)
+            
+            if og_title_match:
+                clean_title = og_title_match.group(1).replace(" | Spotify", "").replace(" - song and lyrics by ", "").replace(" on Apple Music", "")
+            elif title_match:
+                clean_title = title_match.group(1).replace(" | Spotify", "").replace(" - song and lyrics by ", "").replace(" on Apple Music", "")
+            else:
+                await msg.edit_text("⚠️ Could not read the track name from that link.")
+                return
+                
+            og_desc_match = re.search(r'<meta property="og:description" content="(.*?)"', r.text)
+            if og_desc_match and "spotify.com" in message_text.lower():
+                artist_raw = og_desc_match.group(1).split("·")[0].strip()
+                clean_title = f"{clean_title} {artist_raw}"
+                
+            message_text = f"ytsearch1:{clean_title}"
+        except Exception:
+            await msg.edit_text("⚠️ Failed to parse streaming link.")
+            return
+        await msg.delete()
+        
     request_id = str(uuid.uuid4())[:8]
     if "links" not in context.user_data:
         context.user_data["links"] = {}
@@ -1189,7 +1197,7 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if "youtube.com" in message_text.lower() or "youtu.be" in message_text.lower():
         keyboard.append([InlineKeyboardButton("📋 Summarize Video (AI)", callback_data=f"summary|{request_id}")])
 
-    if any(d in message_text.lower() for d in ["tiktok.com", "instagram.com/reel", "youtube.com/shorts", "youtu.be"]):
+    if not message_text.startswith("ytsearch1:") and any(d in message_text.lower() for d in ["tiktok.com", "instagram.com/reel", "youtube.com/shorts", "youtu.be"]):
         keyboard.append([InlineKeyboardButton("🎬 Standard Video (MP4)", callback_data=f"dlv|{request_id}")])
         
     if "list=" in message_text or "/playlist" in message_text or "/album/" in message_text:
@@ -1639,148 +1647,90 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.send_message(update.effective_chat.id, "Sorry, no lyrics found for this song.")
         return
 
-    if data.startswith("cancel"):
-        return await query.edit_message_text("Canceled.")
-
-    if data.startswith("askq"):
-        parts = data.split("|")
-        prefix, req_id = parts[0], parts[1]
-        dl_prefix = "dlpl" if "pl" in prefix else "dl"
-        
-        keyboard = [
-            [InlineKeyboardButton("Standard Audio (MP3)", callback_data=f"{dl_prefix}|{req_id}|standard")],
-            [InlineKeyboardButton("Medium Audio (MP3)", callback_data=f"{dl_prefix}|{req_id}|medium")],
-            [InlineKeyboardButton("High Audio (MP3)", callback_data=f"{dl_prefix}|{req_id}|high")],
-            [InlineKeyboardButton("Voice Message (OGG)", callback_data=f"{dl_prefix}|{req_id}|voice")],
-            [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
-        ]
-        return await query.edit_message_text("Select audio quality:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    if user_active_tasks.get(user_id, 0) > 0:
-        await query.answer("A process is already running. Please wait for it to finish.", show_alert=True)
-        return
-
-    parts = data.split("|")
-    prefix = parts[0]
-
-    if prefix in ("dlv", "dlvi", "dlvc"):
-        req_id = parts[1]
-        start_sec, end_sec = None, None
-        
-        if prefix in ("dlvi", "dlvc"):
-            session = GLOBAL_SESSION.pop(req_id, None)
-            if not session:
-                await query.edit_message_text("Your session expired. Please search or clip again.")
-                return
-            url = session.get("url")
-            start_sec = session.get("start")
-            end_sec = session.get("end")
-        else:
-            url = context.user_data.get("links", {}).pop(req_id, None)
-            if not url:
-                await query.edit_message_text("Your session expired. Please send the link again.")
-                return
-
-        user_last_request[user_id] = time.time()
-        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
-        
-        try:
-            msg = "⚡ Starting download..." if start_sec is None else "✂️ Added clip to queue..."
-            await query.edit_message_text(msg)
-            await asyncio.wait_for(execute_video_download(update.effective_chat.id, url, context, query.message, start_sec, end_sec, req_id=req_id), timeout=PROCESS_TIMEOUT)
-        except (asyncio.TimeoutError, TimeoutError):
-            GLOBAL_CANCEL_FLAGS.add(req_id)
-            await context.bot.send_message(update.effective_chat.id, "⏳ The request took too long (over 4 minutes) and was automatically canceled. Please try again.")
-        except InterruptedError:
-            pass
-        finally:
-            GLOBAL_CANCEL_FLAGS.discard(req_id)
-            if user_active_tasks[user_id] > 0:
-                user_active_tasks[user_id] -= 1
-        return
-
-    if prefix in ("dl", "dlpl", "dli", "dlc"):
-        req_id = parts[1]
-        quality_key = parts[2]
-        start_sec, end_sec = None, None
-        
-        if prefix in ("dli", "dlc"):
-            session = GLOBAL_SESSION.pop(req_id, None)
-            if not session:
-                await query.edit_message_text("Your session expired. Please search or clip again.")
-                return
-            url = session.get("url")
-            start_sec = session.get("start")
-            end_sec = session.get("end")
-        else:
-            url = context.user_data.get("links", {}).pop(req_id, None)
-            if not url:
-                await query.edit_message_text("Your session expired. Please send the link again.")
-                return
-            
-        user_last_request[user_id] = time.time()
-        preset = QUALITY_PRESETS.get(quality_key, QUALITY_PRESETS["medium"])
-        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
-        
-        try:
-            if prefix in ("dl", "dli", "dlc"):
-                msg = f"⚡ Starting download ({preset['label']})..." if start_sec is None else f"✂️ Added clip to queue ({preset['label']})..."
-                await query.edit_message_text(msg)
-                await asyncio.wait_for(execute_download(update.effective_chat.id, url, quality_key, context, query.message, "", start_sec, end_sec, req_id=req_id), timeout=PROCESS_TIMEOUT)
-            else:
-                await query.edit_message_text("📂 Loading playlist details...")
-                def get_playlist():
-                    opts = {
-                        "extract_flat": True,
-                        "quiet": True,
-                        "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios"]}}
-                    }
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        return ydl.extract_info(url, download=False)
-                try:
-                    info = await asyncio.to_thread(get_playlist)
-                    entries = info.get("entries", []) if info else []
-                except Exception: 
-                    entries = []
-                
-                if not entries: 
-                    entries = [{"url": url}]
-                    
-                entries = list(entries)[:MAX_PLAYLIST_ITEMS]
-                
-                await query.edit_message_text(f"📂 Playlist queued: {len(entries)} tracks. Downloading sequentially.")
-                
-                for i, entry in enumerate(entries, 1):
-                    if req_id in GLOBAL_CANCEL_FLAGS:
-                        break
-                    if not entry.get("url"): 
-                        continue
-                    status_msg = await context.bot.send_message(update.effective_chat.id, f"[Track {i}/{len(entries)}] ⚡ Starting download...")
-                    await asyncio.wait_for(execute_download(update.effective_chat.id, entry["url"], quality_key, context, status_msg, f"[Track {i}/{len(entries)}] ", req_id=req_id), timeout=PROCESS_TIMEOUT)
-                    gc.collect()
-                    await asyncio.sleep(1.5)
-        except (asyncio.TimeoutError, TimeoutError):
-            GLOBAL_CANCEL_FLAGS.add(req_id)
-            await context.bot.send_message(update.effective_chat.id, "⏳ The request took too long (over 4 minutes) and was automatically canceled. Please try again.")
-        except InterruptedError:
-            pass
-        finally:
-            GLOBAL_CANCEL_FLAGS.discard(req_id)
-            if user_active_tasks[user_id] > 0:
-                user_active_tasks[user_id] -= 1
-        return
-
-    if data.startswith("analyze|"):
+    if data.startswith("shazam|"):
         req_id = data.split("|")[1]
         session = GLOBAL_SESSION.pop(req_id, None)
         if not session:
-            await query.edit_message_text("Session expired. Please send the audio again.")
+            await query.edit_message_text("Session expired. Please send the voice note again.")
+            return
+            
+        await query.edit_message_text("🎧 Identifying the song...")
+        job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
+        os.makedirs(job_dir, exist_ok=True)
+        try:
+            tg_file = await context.bot.get_file(session["file_id"])
+            temp_path = os.path.join(job_dir, "input_audio.oga")
+            await tg_file.download_to_drive(temp_path)
+            
+            out = await shazam_engine.recognize(temp_path)
+            track = out.get("track")
+            
+            if not track:
+                await query.edit_message_text("⚠️ Shazam didn't recognize this track (common for local Burmese songs).\n\n🤖 Let me try listening to the lyrics with AI...")
+                
+                transcription = await asyncio.to_thread(get_groq_transcription, temp_path)
+                if not transcription or len(transcription.strip()) < 3:
+                    await query.edit_message_text("⚠️ Sorry, I couldn't identify the song or hear the lyrics clearly.")
+                    return
+                
+                search_query = transcription[:100].replace('\n', ' ')
+                
+                def do_fallback_search():
+                    opts = {"quiet": True, "extract_flat": True, "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios"]}}}
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        return ydl.extract_info(f"ytsearch5:{search_query}", download=False)
+                
+                info = await asyncio.to_thread(do_fallback_search)
+                entries = info.get("entries", [])
+                
+                if not entries:
+                    await query.edit_message_text(f"📝 I heard: _{search_query}_\n\n⚠️ But no matches were found on YouTube for those lyrics.", parse_mode="Markdown")
+                    return
+                
+                if "links" not in context.user_data:
+                    context.user_data["links"] = {}
+                keyboard = []
+                for i, entry in enumerate(entries, 1):
+                    t_title = entry.get("title", "Unknown")[:40]
+                    t_req_id = str(uuid.uuid4())[:8]
+                    context.user_data["links"][t_req_id] = entry.get("url")
+                    keyboard.append([InlineKeyboardButton(f"{i}. {t_title}", callback_data=f"askq|{t_req_id}")])
+                
+                keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel|000")])
+                await query.edit_message_text(f"🎵 **AI Lyric Search Results:**\n_{search_query}_", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+            
+            title = track.get("title", "Unknown Title")
+            artist = track.get("subtitle", "Unknown Artist")
+            
+            if "links" not in context.user_data:
+                context.user_data["links"] = {}
+            new_req = str(uuid.uuid4())[:8]
+            context.user_data["links"][new_req] = f"ytsearch1:{title} {artist}"
+            
+            keyboard = [
+                [InlineKeyboardButton("🎵 Download This Song", callback_data=f"askq|{new_req}")],
+                [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
+            ]
+            await query.edit_message_text(f"🎵 Song Found!\nTitle: {title}\nArtist: {artist}\n\nSelect an option below:", reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        except Exception:
+            await query.edit_message_text("Sorry, the song recognition failed.")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return
+        
+    if data.startswith("transcribe|"):
+        req_id = data.split("|")[1]
+        session = GLOBAL_SESSION.pop(req_id, None)
+        if not session:
+            await query.edit_message_text("Session expired. Please send the voice note again.")
             return
             
         user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
         try:
             cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel Processing", callback_data=f"abort|{req_id}")]])
-            await query.edit_message_text("🎹 Analyzing BPM and Musical Key... (Takes a few seconds)", reply_markup=cancel_kb)
+            await query.edit_message_text("📝 AI is transcribing the audio...", reply_markup=cancel_kb)
             job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
             os.makedirs(job_dir, exist_ok=True)
             
@@ -1790,15 +1740,17 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             
             if req_id in GLOBAL_CANCEL_FLAGS:
                 raise InterruptedError()
-                
-            result = await asyncio.wait_for(asyncio.to_thread(analyze_audio_bpm_key, temp_path), timeout=120)
-            await query.edit_message_text(f"🎹 **Audio Analysis:**\n\n{result}", parse_mode="Markdown")
+            
+            transcription = await asyncio.wait_for(asyncio.to_thread(get_groq_transcription, temp_path), timeout=PROCESS_TIMEOUT)
+            if len(transcription) > 4000:
+                transcription = transcription[:4000] + "...\n(Truncated)"
+            await query.edit_message_text(f"📝 **Transcription:**\n\n{transcription}", parse_mode="Markdown")
         except InterruptedError:
             await query.edit_message_text("Process canceled by user.")
         except ValueError as ve:
             await query.edit_message_text(f"⚠️ {ve}")
         except Exception as e:
-            await query.edit_message_text(f"⚠️ Analysis failed: {str(e)[:100]}")
+            await query.edit_message_text(f"⚠️ Transcription failed: {str(e)[:100]}")
         finally:
             GLOBAL_CANCEL_FLAGS.discard(req_id)
             if user_active_tasks[user_id] > 0:
@@ -1852,60 +1804,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             shutil.rmtree(job_dir, ignore_errors=True)
         return
 
-    if data.startswith("study|") or data.startswith("translate|"):
-        req_id = data.split("|")[1]
-        action = data.split("|")[0]
-        session = GLOBAL_SESSION.pop(req_id, None)
-        if not session:
-            await query.edit_message_text("Session expired. Please send the audio again.")
-            return
-            
-        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
-        try:
-            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel Processing", callback_data=f"abort|{req_id}")]])
-            await query.edit_message_text("📝 AI is listening to the audio...", reply_markup=cancel_kb)
-            job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
-            os.makedirs(job_dir, exist_ok=True)
-            
-            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
-            temp_path = os.path.join(job_dir, "input_audio.oga")
-            await tg_file.download_to_drive(temp_path)
-            
-            if req_id in GLOBAL_CANCEL_FLAGS:
-                raise InterruptedError()
-            
-            transcription = await asyncio.wait_for(asyncio.to_thread(get_groq_transcription, temp_path), timeout=PROCESS_TIMEOUT)
-            if not transcription or len(transcription.strip()) < 5:
-                await query.edit_message_text("⚠️ Could not hear enough speech to process.")
-                return
-                
-            if req_id in GLOBAL_CANCEL_FLAGS:
-                raise InterruptedError()
-                
-            await query.edit_message_text("🧠 AI is analyzing the text...", reply_markup=cancel_kb)
-            
-            if action == "study":
-                prompt = "Convert the following transcript into a structured Study Guide syllabus with key takeaways. Then, create 5 multiple-choice flashcard questions at the end to test the reader's knowledge."
-            else:
-                prompt = "Translate the following text accurately into English, Burmese, and Japanese. Format it clearly with headings for each language."
-                
-            result = await asyncio.wait_for(asyncio.to_thread(get_groq_completion, prompt, transcription), timeout=120)
-            if len(result) > 4000:
-                result = result[:4000] + "...\n(Truncated due to limits)"
-            await query.edit_message_text(result, parse_mode="Markdown")
-        except InterruptedError:
-            await query.edit_message_text("Process canceled by user.")
-        except ValueError as ve:
-            await query.edit_message_text(f"⚠️ {ve}")
-        except Exception as e:
-            await query.edit_message_text(f"⚠️ Process failed: {str(e)[:100]}")
-        finally:
-            GLOBAL_CANCEL_FLAGS.discard(req_id)
-            if user_active_tasks[user_id] > 0:
-                user_active_tasks[user_id] -= 1
-            shutil.rmtree(job_dir, ignore_errors=True)
-        return
-
     if data.startswith("extract|"):
         req_id = data.split("|")[1]
         session = GLOBAL_SESSION.pop(req_id, None)
@@ -1944,188 +1842,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text("Process canceled by user.")
         except Exception as e:
             await query.edit_message_text(f"⚠️ Extraction failed: {str(e)[:100]}")
-        finally:
-            GLOBAL_CANCEL_FLAGS.discard(req_id)
-            if user_active_tasks[user_id] > 0:
-                user_active_tasks[user_id] -= 1
-            shutil.rmtree(job_dir, ignore_errors=True)
-        return
-
-    if data.startswith("srt|"):
-        req_id = data.split("|")[1]
-        session = GLOBAL_SESSION.pop(req_id, None)
-        if not session:
-            await query.edit_message_text("Session expired. Please send the video again.")
-            return
-            
-        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
-        try:
-            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel Processing", callback_data=f"abort|{req_id}")]])
-            await query.edit_message_text("📝 Preparing video audio for AI transcription...", reply_markup=cancel_kb)
-            job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
-            os.makedirs(job_dir, exist_ok=True)
-            
-            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
-            temp_path = os.path.join(job_dir, "input_video.mp4")
-            audio_path = os.path.join(job_dir, "temp_audio.ogg")
-            srt_path = os.path.join(job_dir, "subtitles.srt")
-            await tg_file.download_to_drive(temp_path)
-            
-            if req_id in GLOBAL_CANCEL_FLAGS:
-                raise InterruptedError()
-            
-            def extract_ogg():
-                subprocess.run(['ffmpeg', '-y', '-i', temp_path, '-vn', '-c:a', 'libopus', '-b:a', '32k', audio_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                
-            await asyncio.to_thread(extract_ogg)
-            
-            if req_id in GLOBAL_CANCEL_FLAGS:
-                raise InterruptedError()
-            
-            await query.edit_message_text("📝 AI is generating perfectly synced subtitles...", reply_markup=cancel_kb)
-            srt_text = await asyncio.wait_for(asyncio.to_thread(get_groq_transcription, audio_path, True), timeout=PROCESS_TIMEOUT)
-            
-            if req_id in GLOBAL_CANCEL_FLAGS:
-                raise InterruptedError()
-            
-            with open(srt_path, "w", encoding="utf-8") as f:
-                f.write(srt_text)
-                
-            await query.edit_message_text("⚡ Uploading subtitle file...", reply_markup=cancel_kb)
-            with open(srt_path, "rb") as doc:
-                await context.bot.send_document(chat_id=update.effective_chat.id, document=doc, filename="subtitles.srt", caption="📝 Auto-Generated Subtitles", read_timeout=120, write_timeout=120)
-            await query.message.delete()
-        except InterruptedError:
-            await query.edit_message_text("Process canceled by user.")
-        except ValueError as ve:
-            await query.edit_message_text(f"⚠️ {ve}")
-        except Exception as e:
-            await query.edit_message_text(f"⚠️ Subtitle generation failed: {str(e)[:100]}")
-        finally:
-            GLOBAL_CANCEL_FLAGS.discard(req_id)
-            if user_active_tasks[user_id] > 0:
-                user_active_tasks[user_id] -= 1
-            shutil.rmtree(job_dir, ignore_errors=True)
-        return
-
-    if data.startswith("shazam|"):
-        req_id = data.split("|")[1]
-        session = GLOBAL_SESSION.pop(req_id, None)
-        if not session:
-            await query.edit_message_text("Session expired. Please send the voice note again.")
-            return
-            
-        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
-        try:
-            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel Processing", callback_data=f"abort|{req_id}")]])
-            await query.edit_message_text("🎧 Identifying the song...", reply_markup=cancel_kb)
-            job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
-            os.makedirs(job_dir, exist_ok=True)
-            
-            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
-            temp_path = os.path.join(job_dir, "input_audio.oga")
-            await tg_file.download_to_drive(temp_path)
-            
-            if req_id in GLOBAL_CANCEL_FLAGS:
-                raise InterruptedError()
-            
-            out = await asyncio.wait_for(shazam_engine.recognize(temp_path), timeout=60)
-            track = out.get("track")
-            
-            if not track:
-                await query.edit_message_text("⚠️ Shazam didn't recognize this track.\n\n🤖 Let me try listening to the lyrics with AI...", reply_markup=cancel_kb)
-                
-                if req_id in GLOBAL_CANCEL_FLAGS:
-                    raise InterruptedError()
-                
-                transcription = await asyncio.to_thread(get_groq_transcription, temp_path)
-                if not transcription or len(transcription.strip()) < 3:
-                    await query.edit_message_text("⚠️ Sorry, I couldn't identify the song or hear the lyrics clearly.")
-                    return
-                
-                search_query = transcription[:100].replace('\n', ' ')
-                
-                def do_fallback_search():
-                    opts = {"quiet": True, "extract_flat": True, "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios"]}}}
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        return ydl.extract_info(f"ytsearch5:{search_query}", download=False)
-                
-                info = await asyncio.to_thread(do_fallback_search)
-                entries = info.get("entries", [])
-                
-                if not entries:
-                    await query.edit_message_text(f"📝 I heard: _{search_query}_\n\n⚠️ But no matches were found on YouTube for those lyrics.", parse_mode="Markdown")
-                    return
-                
-                if "links" not in context.user_data:
-                    context.user_data["links"] = {}
-                keyboard = []
-                for i, entry in enumerate(entries, 1):
-                    t_title = entry.get("title", "Unknown")[:40]
-                    t_req_id = str(uuid.uuid4())[:8]
-                    context.user_data["links"][t_req_id] = entry.get("url")
-                    keyboard.append([InlineKeyboardButton(f"{i}. {t_title}", callback_data=f"askq|{t_req_id}")])
-                
-                keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel|000")])
-                await query.edit_message_text(f"🎵 **AI Lyric Search Results:**\n_{search_query}_", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-                return
-            
-            title = track.get("title", "Unknown Title")
-            artist = track.get("subtitle", "Unknown Artist")
-            
-            if "links" not in context.user_data:
-                context.user_data["links"] = {}
-            new_req = str(uuid.uuid4())[:8]
-            context.user_data["links"][new_req] = f"ytsearch1:{title} {artist}"
-            
-            keyboard = [
-                [InlineKeyboardButton("🎵 Download This Song", callback_data=f"askq|{new_req}")],
-                [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
-            ]
-            await query.edit_message_text(f"🎵 Song Found!\nTitle: {title}\nArtist: {artist}\n\nSelect an option below:", reply_markup=InlineKeyboardMarkup(keyboard))
-            
-        except InterruptedError:
-            await query.edit_message_text("Process canceled by user.")
-        except Exception:
-            await query.edit_message_text("Sorry, the song recognition failed.")
-        finally:
-            GLOBAL_CANCEL_FLAGS.discard(req_id)
-            if user_active_tasks[user_id] > 0:
-                user_active_tasks[user_id] -= 1
-            shutil.rmtree(job_dir, ignore_errors=True)
-        return
-
-    if data.startswith("transcribe|"):
-        req_id = data.split("|")[1]
-        session = GLOBAL_SESSION.pop(req_id, None)
-        if not session:
-            await query.edit_message_text("Session expired. Please send the voice note again.")
-            return
-            
-        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
-        try:
-            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel Processing", callback_data=f"abort|{req_id}")]])
-            await query.edit_message_text("📝 AI is transcribing the audio...", reply_markup=cancel_kb)
-            job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
-            os.makedirs(job_dir, exist_ok=True)
-            
-            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
-            temp_path = os.path.join(job_dir, "input_audio.oga")
-            await tg_file.download_to_drive(temp_path)
-            
-            if req_id in GLOBAL_CANCEL_FLAGS:
-                raise InterruptedError()
-            
-            transcription = await asyncio.wait_for(asyncio.to_thread(get_groq_transcription, temp_path), timeout=PROCESS_TIMEOUT)
-            if len(transcription) > 4000:
-                transcription = transcription[:4000] + "...\n(Truncated)"
-            await query.edit_message_text(f"📝 **Transcription:**\n\n{transcription}", parse_mode="Markdown")
-        except InterruptedError:
-            await query.edit_message_text("Process canceled by user.")
-        except ValueError as ve:
-            await query.edit_message_text(f"⚠️ {ve}")
-        except Exception as e:
-            await query.edit_message_text(f"⚠️ Transcription failed: {str(e)[:100]}")
         finally:
             GLOBAL_CANCEL_FLAGS.discard(req_id)
             if user_active_tasks[user_id] > 0:
@@ -2247,6 +1963,136 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 user_active_tasks[user_id] -= 1
             shutil.rmtree(job_dir, ignore_errors=True)
         return
+
+    if data.startswith("cancel"):
+        return await query.edit_message_text("Canceled.")
+
+    if data.startswith("askq"):
+        parts = data.split("|")
+        prefix, req_id = parts[0], parts[1]
+        dl_prefix = "dlpl" if "pl" in prefix else "dl"
+        
+        keyboard = [
+            [InlineKeyboardButton("Standard Audio (MP3)", callback_data=f"{dl_prefix}|{req_id}|standard")],
+            [InlineKeyboardButton("Medium Audio (MP3)", callback_data=f"{dl_prefix}|{req_id}|medium")],
+            [InlineKeyboardButton("High Audio (MP3)", callback_data=f"{dl_prefix}|{req_id}|high")],
+            [InlineKeyboardButton("Voice Message (OGG)", callback_data=f"{dl_prefix}|{req_id}|voice")],
+            [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
+        ]
+        return await query.edit_message_text("Select audio quality:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    if user_active_tasks.get(user_id, 0) > 0:
+        await query.answer("A process is already running. Please wait for it to finish.", show_alert=True)
+        return
+
+    parts = data.split("|")
+    prefix = parts[0]
+
+    if prefix in ("dlv", "dlvi", "dlvc"):
+        req_id = parts[1]
+        start_sec, end_sec = None, None
+        
+        if prefix in ("dlvi", "dlvc"):
+            session = GLOBAL_SESSION.pop(req_id, None)
+            if not session:
+                await query.edit_message_text("Your session expired. Please search or clip again.")
+                return
+            url = session.get("url")
+            start_sec = session.get("start")
+            end_sec = session.get("end")
+        else:
+            url = context.user_data.get("links", {}).pop(req_id, None)
+            if not url:
+                await query.edit_message_text("Your session expired. Please send the link again.")
+                return
+
+        user_last_request[user_id] = time.time()
+        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
+        
+        try:
+            msg = "⚡ Starting download..." if start_sec is None else "✂️ Added clip to queue..."
+            await query.edit_message_text(msg)
+            await asyncio.wait_for(execute_video_download(update.effective_chat.id, url, context, query.message, start_sec, end_sec, req_id=req_id), timeout=PROCESS_TIMEOUT)
+        except (asyncio.TimeoutError, TimeoutError):
+            GLOBAL_CANCEL_FLAGS.add(req_id)
+            await context.bot.send_message(update.effective_chat.id, "⏳ The request took too long and was automatically canceled. Please try again.")
+        except InterruptedError:
+            pass
+        finally:
+            GLOBAL_CANCEL_FLAGS.discard(req_id)
+            if user_active_tasks[user_id] > 0:
+                user_active_tasks[user_id] -= 1
+        return
+
+    if prefix in ("dl", "dlpl", "dli", "dlc"):
+        req_id = parts[1]
+        quality_key = parts[2]
+        start_sec, end_sec = None, None
+        
+        if prefix in ("dli", "dlc"):
+            session = GLOBAL_SESSION.pop(req_id, None)
+            if not session:
+                await query.edit_message_text("Your session expired. Please search or clip again.")
+                return
+            url = session.get("url")
+            start_sec = session.get("start")
+            end_sec = session.get("end")
+        else:
+            url = context.user_data.get("links", {}).pop(req_id, None)
+            if not url:
+                await query.edit_message_text("Your session expired. Please send the link again.")
+                return
+            
+        user_last_request[user_id] = time.time()
+        preset = QUALITY_PRESETS.get(quality_key, QUALITY_PRESETS["medium"])
+        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
+        
+        try:
+            if prefix in ("dl", "dli", "dlc"):
+                msg = f"⚡ Starting download ({preset['label']})..." if start_sec is None else f"✂️ Added clip to queue ({preset['label']})..."
+                await query.edit_message_text(msg)
+                await asyncio.wait_for(execute_download(update.effective_chat.id, url, quality_key, context, query.message, "", start_sec, end_sec, req_id=req_id), timeout=PROCESS_TIMEOUT)
+            else:
+                await query.edit_message_text("📂 Loading playlist details...")
+                def get_playlist():
+                    opts = {
+                        "extract_flat": True,
+                        "quiet": True,
+                        "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios"]}}
+                    }
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        return ydl.extract_info(url, download=False)
+                try:
+                    info = await asyncio.to_thread(get_playlist)
+                    entries = info.get("entries", []) if info else []
+                except Exception: 
+                    entries = []
+                
+                if not entries: 
+                    entries = [{"url": url}]
+                    
+                entries = list(entries)[:MAX_PLAYLIST_ITEMS]
+                
+                await query.edit_message_text(f"📂 Playlist queued: {len(entries)} tracks. Downloading sequentially.")
+                
+                for i, entry in enumerate(entries, 1):
+                    if req_id in GLOBAL_CANCEL_FLAGS:
+                        break
+                    if not entry.get("url"): 
+                        continue
+                    status_msg = await context.bot.send_message(update.effective_chat.id, f"[Track {i}/{len(entries)}] ⚡ Starting download...")
+                    await asyncio.wait_for(execute_download(update.effective_chat.id, entry["url"], quality_key, context, status_msg, f"[Track {i}/{len(entries)}] ", req_id=req_id), timeout=PROCESS_TIMEOUT)
+                    gc.collect()
+                    await asyncio.sleep(1.5)
+        except (asyncio.TimeoutError, TimeoutError):
+            GLOBAL_CANCEL_FLAGS.add(req_id)
+            await context.bot.send_message(update.effective_chat.id, "⏳ The request took too long and was automatically canceled. Please try again.")
+        except InterruptedError:
+            pass
+        finally:
+            GLOBAL_CANCEL_FLAGS.discard(req_id)
+            if user_active_tasks[user_id] > 0:
+                user_active_tasks[user_id] -= 1
 
 def main() -> None:
     if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
