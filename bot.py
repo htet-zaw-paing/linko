@@ -36,7 +36,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- Environment Variables ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 PORT = int(os.environ.get("PORT", 8080))
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -54,7 +53,7 @@ user_last_request: dict[int, float] = {}
 user_active_tasks: dict[int, int] = {}
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 MAX_PLAYLIST_ITEMS = 10
-PROCESS_TIMEOUT = 240  # 4 minutes max per job
+PROCESS_TIMEOUT = 240
 
 MAX_QUEUE_CAPACITY = 100
 current_in_queue = 0
@@ -171,7 +170,6 @@ def parse_time_to_seconds(t_str: str) -> int:
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     return int(t_str)
 
-# --- AI API Integrations ---
 def get_groq_transcription(audio_path: str) -> str:
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is not configured. Please add it to the server environment variables.")
@@ -220,7 +218,6 @@ def get_groq_summary(text_content: str) -> str:
         
     return resp.json()["choices"][0]["message"]["content"].strip()
 
-# --- Advanced Compression ---
 def compress_video_to_50mb(input_path: str, output_path: str) -> None:
     try:
         cmd_dur = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_path]
@@ -247,7 +244,6 @@ def compress_video_to_50mb(input_path: str, output_path: str) -> None:
     except Exception as e:
         raise ValueError(f"Compression engine failed: {str(e)}")
 
-# --- Cobalt & YT-DLP Core ---
 def FastCheckAudioBypass(url: str, bitrate: str) -> dict | None:
     if url.startswith("ytsearch"):
         return None
@@ -595,7 +591,6 @@ def build_audio_buttons(raw_title: str, uploader: str) -> tuple[InlineKeyboardMa
     ])
     return InlineKeyboardMarkup(action_buttons), clean_title
 
-# --- Handlers ---
 async def post_init(application) -> None:
     commands = [
         BotCommand("start", "Start the bot"),
@@ -1538,15 +1533,18 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             tg_file = await context.bot.get_file(session["file_id"])
             temp_path = os.path.join(job_dir, "input_audio.ogg")
+            mp3_path = os.path.join(job_dir, "input_audio.mp3")
             await tg_file.download_to_drive(temp_path)
             
-            out = await shazam_engine.recognize(temp_path)
+            subprocess.run(["ffmpeg", "-y", "-i", temp_path, "-ar", "44100", "-ac", "2", mp3_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            out = await shazam_engine.recognize(mp3_path)
             track = out.get("track")
             
             if not track:
                 await query.edit_message_text("⚠️ Shazam didn't recognize this track (common for local Burmese songs).\n\n🤖 Let me try listening to the lyrics with AI...")
                 
-                transcription = await asyncio.to_thread(get_groq_transcription, temp_path)
+                transcription = await asyncio.to_thread(get_groq_transcription, mp3_path)
                 if not transcription or len(transcription.strip()) < 3:
                     await query.edit_message_text("⚠️ Sorry, I couldn't identify the song or hear the lyrics clearly.")
                     return
@@ -1641,11 +1639,15 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     "skip_download": True,
                     "writesubtitles": True,
                     "writeautomaticsub": True,
-                    "subtitleslangs": ["en", "en-US", "en-GB"],
+                    "subtitleslangs": ["en", "en-US", "en-GB", "my", "my-MM"],
                     "subtitlesformat": "vtt",
                     "outtmpl": os.path.join(job_dir, "video"),
-                    "quiet": True
+                    "quiet": True,
+                    "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios", "web"]}}
                 }
+                if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
+                    opts["cookiefile"] = COOKIES_FILE_PATH
+                
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.extract_info(url, download=True)
                 
@@ -1658,7 +1660,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             vtt_file = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.vtt')), None)
             
             if not vtt_file:
-                await query.edit_message_text("⚠️ No English captions were found for this video. The AI cannot summarize it.")
+                await query.edit_message_text("⚠️ No suitable captions were found for this video. The AI cannot summarize it.")
                 return
                 
             with open(vtt_file, "r", encoding="utf-8") as f:
@@ -1842,7 +1844,6 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Sticker.ALL | filters.ANIMATION, handle_sticker_gif))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio_recognition))
     
-    # Message handlers setup for tags & media
     application.add_handler(MessageHandler(filters.PHOTO & filters.REPLY & filters.CaptionRegex(r"^/edit"), edit_tags_command))
     application.add_handler(MessageHandler(filters.Document.ALL | (filters.PHOTO & ~filters.REPLY) | filters.VIDEO, handle_media))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link_message))
