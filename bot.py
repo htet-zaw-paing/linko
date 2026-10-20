@@ -839,7 +839,7 @@ async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 output_mp3
             ]
             
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        await asyncio.to_thread(subprocess.run, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         
         await status_msg.edit_text("⚡ Uploading newly tagged file...")
         btn, _ = build_audio_buttons(title, artist)
@@ -854,7 +854,10 @@ async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     performer=artist, 
                     thumbnail=thumb_file, 
                     caption="🏷️ Tags Updated!", 
-                    reply_markup=btn
+                    reply_markup=btn,
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=60
                 )
             finally:
                 if thumb_file:
@@ -1596,7 +1599,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
         return
-        
+
     if data.startswith("cancel"):
         return await query.edit_message_text("Canceled.")
 
