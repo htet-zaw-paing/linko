@@ -53,7 +53,7 @@ user_last_request: dict[int, float] = {}
 user_active_tasks: dict[int, int] = {}
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 MAX_PLAYLIST_ITEMS = 10
-PROCESS_TIMEOUT = 240
+PROCESS_TIMEOUT = 240  
 
 MAX_QUEUE_CAPACITY = 100
 current_in_queue = 0
@@ -1532,19 +1532,16 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         os.makedirs(job_dir, exist_ok=True)
         try:
             tg_file = await context.bot.get_file(session["file_id"])
-            temp_path = os.path.join(job_dir, "input_audio.ogg")
-            mp3_path = os.path.join(job_dir, "input_audio.mp3")
+            temp_path = os.path.join(job_dir, "input_audio.oga")
             await tg_file.download_to_drive(temp_path)
             
-            subprocess.run(["ffmpeg", "-y", "-i", temp_path, "-ar", "44100", "-ac", "2", mp3_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            out = await shazam_engine.recognize(mp3_path)
+            out = await shazam_engine.recognize(temp_path)
             track = out.get("track")
             
             if not track:
                 await query.edit_message_text("⚠️ Shazam didn't recognize this track (common for local Burmese songs).\n\n🤖 Let me try listening to the lyrics with AI...")
                 
-                transcription = await asyncio.to_thread(get_groq_transcription, mp3_path)
+                transcription = await asyncio.to_thread(get_groq_transcription, temp_path)
                 if not transcription or len(transcription.strip()) < 3:
                     await query.edit_message_text("⚠️ Sorry, I couldn't identify the song or hear the lyrics clearly.")
                     return
@@ -1608,7 +1605,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         os.makedirs(job_dir, exist_ok=True)
         try:
             tg_file = await context.bot.get_file(session["file_id"])
-            temp_path = os.path.join(job_dir, "input_audio.ogg")
+            temp_path = os.path.join(job_dir, "input_audio.oga")
             await tg_file.download_to_drive(temp_path)
             
             transcription = await asyncio.to_thread(get_groq_transcription, temp_path)
@@ -1636,7 +1633,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 opts = {
                     "skip_download": True,
                     "quiet": True,
-                    "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios", "web"]}}
+                    "extractor_args": {"youtube": {"player_client": ["web", "tv_embedded", "ios"]}}
                 }
                 if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
                     opts["cookiefile"] = COOKIES_FILE_PATH
@@ -1645,51 +1642,39 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     
             info = await asyncio.to_thread(fetch_info)
             
-            subs = info.get('subtitles', {})
-            auto_subs = info.get('automatic_captions', {})
-            target_langs = ['en', 'en-US', 'en-GB', 'en-orig', 'en-IN', 'my', 'my-MM']
+            target_langs = ['en', 'en-US', 'en-GB', 'en-orig', 'a.en', 'my', 'my-MM', 'a.my']
             sub_url = None
-            is_json3 = False
             
-            for lang_dict in [subs, auto_subs]:
-                if sub_url:
-                    break
+            for lang_dict in [info.get('subtitles', {}), info.get('automatic_captions', {})]:
                 for lang in target_langs:
                     if lang in lang_dict:
-                        formats = lang_dict[lang]
-                        for f in formats:
+                        for f in lang_dict[lang]:
                             if f.get('ext') == 'json3':
                                 sub_url = f.get('url')
-                                is_json3 = True
                                 break
-                        if not sub_url and formats:
-                            sub_url = formats[0].get('url')
-                        if sub_url:
-                            break
-            
-            if not sub_url:
-                for lang_dict in [subs, auto_subs]:
+                        if not sub_url and lang_dict[lang]:
+                            sub_url = lang_dict[lang][0].get('url')
                     if sub_url:
                         break
+                if sub_url:
+                    break
+            
+            if not sub_url:
+                for lang_dict in [info.get('subtitles', {}), info.get('automatic_captions', {})]:
                     for key, formats in lang_dict.items():
-                        if 'en' in key.lower() or 'my' in key.lower():
-                            for f in formats:
-                                if f.get('ext') == 'json3':
-                                    sub_url = f.get('url')
-                                    is_json3 = True
-                                    break
-                            if not sub_url and formats:
-                                sub_url = formats[0].get('url')
-                            if sub_url:
-                                break
-                                
+                        if formats:
+                            sub_url = formats[0].get('url')
+                            break
+                    if sub_url:
+                        break
+                        
             if not sub_url:
                 await query.edit_message_text("⚠️ No suitable captions were found for this video. The AI cannot summarize it.")
                 return
                 
             resp = await asyncio.to_thread(requests.get, sub_url, timeout=10)
             
-            if is_json3 or 'json3' in sub_url:
+            if 'json3' in sub_url:
                 data_json = resp.json()
                 events = data_json.get('events', [])
                 text_parts = []
@@ -1709,6 +1694,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await query.edit_message_text("⚠️ Caption track is empty or unreadable.")
                 return
                 
+            clean_text = clean_text[:20000]
             await query.edit_message_text("📋 AI is analyzing the transcript...")
             summary = await asyncio.to_thread(get_groq_summary, clean_text)
             await query.edit_message_text(f"📋 **AI Video Summary:**\n\n{summary}", parse_mode="Markdown")
