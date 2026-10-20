@@ -805,20 +805,24 @@ async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await status_msg.edit_text("⚠️ This audio file is too large (over 20MB) for the bot to edit directly due to Telegram limits.")
             return
 
-        orig_file = await context.bot.get_file(update.message.reply_to_message.audio.file_id)
+        orig_file = await context.bot.get_file(update.message.reply_to_message.audio.file_id, read_timeout=120, write_timeout=120, connect_timeout=60)
         input_mp3 = os.path.join(job_dir, "input.mp3")
         output_mp3 = os.path.join(job_dir, "output.mp3")
         await orig_file.download_to_drive(input_mp3)
         
         photo_path = None
+        thumb_to_send = None
+
         if update.message.photo:
-            photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
+            photo_file = await context.bot.get_file(update.message.photo[-1].file_id, read_timeout=120, write_timeout=120, connect_timeout=60)
             photo_path = os.path.join(job_dir, "cover.jpg")
             await photo_file.download_to_drive(photo_path)
+            thumb_to_send = photo_path
         elif update.message.reply_to_message.audio.thumbnail:
-            photo_file = await context.bot.get_file(update.message.reply_to_message.audio.thumbnail.file_id)
-            photo_path = os.path.join(job_dir, "cover.jpg")
-            await photo_file.download_to_drive(photo_path)
+            orig_thumb_file = await context.bot.get_file(update.message.reply_to_message.audio.thumbnail.file_id, read_timeout=120, write_timeout=120, connect_timeout=60)
+            orig_thumb_path = os.path.join(job_dir, "orig_thumb.jpg")
+            await orig_thumb_file.download_to_drive(orig_thumb_path)
+            thumb_to_send = orig_thumb_path
             
         await status_msg.edit_text("🏷️ Injecting ID3 Tags and Cover Art...")
         
@@ -845,14 +849,14 @@ async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         btn, _ = build_audio_buttons(title, artist)
         
         with open(output_mp3, "rb") as af:
-            thumb_file = open(photo_path, "rb") if photo_path else None
+            thumb_file_obj = open(thumb_to_send, "rb") if thumb_to_send and os.path.exists(thumb_to_send) else None
             try:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id, 
                     audio=af, 
                     title=title, 
                     performer=artist, 
-                    thumbnail=thumb_file, 
+                    thumbnail=thumb_file_obj, 
                     caption="🏷️ Tags Updated!", 
                     reply_markup=btn,
                     read_timeout=120,
@@ -860,12 +864,16 @@ async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     connect_timeout=60
                 )
             finally:
-                if thumb_file:
-                    thumb_file.close()
+                if thumb_file_obj:
+                    thumb_file_obj.close()
                 
         await status_msg.delete()
     except Exception as e:
-        await status_msg.edit_text(f"⚠️ Failed to update tags: {str(e)}")
+        err_msg = str(e).lower()
+        if "timed out" in err_msg or "timeout" in err_msg:
+            await status_msg.edit_text("⚠️ Process timed out while communicating with Telegram's servers. Please try again.")
+        else:
+            await status_msg.edit_text(f"⚠️ Failed to update tags: {str(e)}")
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -1049,7 +1057,7 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["links"][request_id] = message_text
     
     keyboard = []
-
+    
     if any(d in message_text.lower() for d in ["tiktok.com", "instagram.com/reel", "youtube.com/shorts", "youtu.be"]):
         keyboard.append([InlineKeyboardButton("🎬 Standard Video (MP4)", callback_data=f"dlv|{request_id}")])
         
@@ -1511,7 +1519,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
         os.makedirs(job_dir, exist_ok=True)
         try:
-            tg_file = await context.bot.get_file(session["file_id"])
+            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
             temp_path = os.path.join(job_dir, "input_audio.oga")
             await tg_file.download_to_drive(temp_path)
             
@@ -1584,7 +1592,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
         os.makedirs(job_dir, exist_ok=True)
         try:
-            tg_file = await context.bot.get_file(session["file_id"])
+            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
             temp_path = os.path.join(job_dir, "input_audio.oga")
             await tg_file.download_to_drive(temp_path)
             
