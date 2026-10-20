@@ -16,6 +16,7 @@ import requests
 from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
+import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     ApplicationBuilder,
@@ -53,7 +54,7 @@ user_last_request: dict[int, float] = {}
 user_active_tasks: dict[int, int] = {}
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", 1800))
 MAX_PLAYLIST_ITEMS = 10
-PROCESS_TIMEOUT = 240  
+PROCESS_TIMEOUT = 240
 
 MAX_QUEUE_CAPACITY = 100
 current_in_queue = 0
@@ -172,7 +173,7 @@ def parse_time_to_seconds(t_str: str) -> int:
 
 def get_groq_transcription(audio_path: str) -> str:
     if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY is not configured. Please add it to the server environment variables.")
+        raise ValueError("GROQ_API_KEY is not configured.")
     if os.path.getsize(audio_path) > 25 * 1024 * 1024:
         raise ValueError("File is too large for AI transcription (Max 25 MB).")
         
@@ -183,40 +184,9 @@ def get_groq_transcription(audio_path: str) -> str:
         resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions", headers=headers, files=files, data=data, timeout=60)
     
     if resp.status_code != 200:
-        raise ValueError(f"Groq API Error: {resp.text}")
+        raise ValueError(f"API Error: {resp.text}")
     
     return resp.text.strip()
-
-def get_groq_summary(text_content: str) -> str:
-    if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY is not configured. Please add it to the server environment variables.")
-    
-    truncated_text = text_content[:20000] 
-    
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "llama3-8b-8192",
-        "messages": [
-            {
-                "role": "system", 
-                "content": "You are an assistant that summarizes video transcripts. Provide a clear, concise 5-bullet-point summary of the main topics discussed. Do not add conversational filler, just return the bullet points."
-            },
-            {
-                "role": "user", 
-                "content": truncated_text
-            }
-        ],
-        "temperature": 0.5
-    }
-    resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
-    
-    if resp.status_code != 200:
-        raise ValueError(f"API Error ({resp.status_code}): {resp.text[:100]}...")
-        
-    return resp.json()["choices"][0]["message"]["content"].strip()
 
 def compress_video_to_50mb(input_path: str, output_path: str) -> None:
     try:
@@ -591,6 +561,12 @@ def build_audio_buttons(raw_title: str, uploader: str) -> tuple[InlineKeyboardMa
     ])
     return InlineKeyboardMarkup(action_buttons), clean_title
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, telegram.error.Conflict):
+        logger.warning("Conflict error detected. Waiting for old deployment instance to close.")
+    else:
+        logger.error("Exception while handling an update:", exc_info=context.error)
+
 async def post_init(application) -> None:
     commands = [
         BotCommand("start", "Start the bot"),
@@ -752,8 +728,8 @@ async def send_donation_info(chat_id, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             await context.bot.send_photo(chat_id=chat_id, photo=KBZPAY_QR_URL, caption=donate_caption)
             return
-        except Exception as e:
-            logger.error(f"Failed to send QR image from URL: {e}")
+        except Exception:
+            pass
             
     fallback_caption = donate_caption.replace(" scanning the KBZPay QR code above", " supporting our project")
     await context.bot.send_message(chat_id=chat_id, text=fallback_caption)
@@ -839,13 +815,17 @@ async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
             photo_path = os.path.join(job_dir, "cover.jpg")
             await photo_file.download_to_drive(photo_path)
+        elif update.message.reply_to_message.audio.thumbnail:
+            photo_file = await context.bot.get_file(update.message.reply_to_message.audio.thumbnail.file_id)
+            photo_path = os.path.join(job_dir, "cover.jpg")
+            await photo_file.download_to_drive(photo_path)
             
         await status_msg.edit_text("🏷️ Injecting ID3 Tags and Cover Art...")
         
         if photo_path:
             cmd = [
                 'ffmpeg', '-y', '-i', input_mp3, '-i', photo_path, 
-                '-map', '0:0', '-map', '1:0', '-c', 'copy', 
+                '-map', '0:a', '-map', '1:0', '-c', 'copy', 
                 '-id3v2_version', '3', '-metadata:s:v', 'title="Album cover"', 
                 '-metadata:s:v', 'comment="Cover (front)"', 
                 '-metadata', f'title={title}', '-metadata', f'artist={artist}', 
@@ -853,7 +833,7 @@ async def edit_tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             ]
         else:
             cmd = [
-                'ffmpeg', '-y', '-i', input_mp3, '-c', 'copy', 
+                'ffmpeg', '-y', '-i', input_mp3, '-map', '0', '-c', 'copy', 
                 '-id3v2_version', '3', 
                 '-metadata', f'title={title}', '-metadata', f'artist={artist}', 
                 output_mp3
@@ -1066,9 +1046,6 @@ async def handle_link_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["links"][request_id] = message_text
     
     keyboard = []
-    
-    if "youtube.com" in message_text.lower() or "youtu.be" in message_text.lower():
-        keyboard.append([InlineKeyboardButton("📋 Summarize Video (AI)", callback_data=f"summary|{request_id}")])
 
     if any(d in message_text.lower() for d in ["tiktok.com", "instagram.com/reel", "youtube.com/shorts", "youtu.be"]):
         keyboard.append([InlineKeyboardButton("🎬 Standard Video (MP4)", callback_data=f"dlv|{request_id}")])
@@ -1620,91 +1597,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             shutil.rmtree(job_dir, ignore_errors=True)
         return
         
-    if data.startswith("summary|"):
-        req_id = data.split("|")[1]
-        url = context.user_data.get("links", {}).get(req_id, None)
-        if not url:
-            await query.edit_message_text("Session expired. Please send the link again.")
-            return
-            
-        await query.edit_message_text("📋 Fetching video transcript for AI summarization...")
-        try:
-            def fetch_info():
-                opts = {
-                    "skip_download": True,
-                    "quiet": True,
-                    "extractor_args": {"youtube": {"player_client": ["web", "tv_embedded", "ios"]}}
-                }
-                if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
-                    opts["cookiefile"] = COOKIES_FILE_PATH
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(url, download=False)
-                    
-            info = await asyncio.to_thread(fetch_info)
-            
-            target_langs = ['en', 'en-US', 'en-GB', 'en-orig', 'a.en', 'my', 'my-MM', 'a.my']
-            sub_url = None
-            
-            for lang_dict in [info.get('subtitles', {}), info.get('automatic_captions', {})]:
-                for lang in target_langs:
-                    if lang in lang_dict:
-                        for f in lang_dict[lang]:
-                            if f.get('ext') == 'json3':
-                                sub_url = f.get('url')
-                                break
-                        if not sub_url and lang_dict[lang]:
-                            sub_url = lang_dict[lang][0].get('url')
-                    if sub_url:
-                        break
-                if sub_url:
-                    break
-            
-            if not sub_url:
-                for lang_dict in [info.get('subtitles', {}), info.get('automatic_captions', {})]:
-                    for key, formats in lang_dict.items():
-                        if formats:
-                            sub_url = formats[0].get('url')
-                            break
-                    if sub_url:
-                        break
-                        
-            if not sub_url:
-                await query.edit_message_text("⚠️ No suitable captions were found for this video. The AI cannot summarize it.")
-                return
-                
-            resp = await asyncio.to_thread(requests.get, sub_url, timeout=10)
-            
-            if 'json3' in sub_url:
-                data_json = resp.json()
-                events = data_json.get('events', [])
-                text_parts = []
-                for ev in events:
-                    if 'segs' in ev:
-                        for seg in ev['segs']:
-                            if 'utf8' in seg:
-                                text_parts.append(seg['utf8'])
-                clean_text = "".join(text_parts).replace('\n', ' ').strip()
-            else:
-                raw_text = resp.text
-                clean_text = re.sub(r'<[^>]+>', ' ', raw_text)
-                clean_text = re.sub(r'&\w+;', ' ', clean_text)
-                clean_text = re.sub(r'\n+', ' ', clean_text).strip()
-                
-            if not clean_text or len(clean_text) < 10:
-                await query.edit_message_text("⚠️ Caption track is empty or unreadable.")
-                return
-                
-            clean_text = clean_text[:20000]
-            await query.edit_message_text("📋 AI is analyzing the transcript...")
-            summary = await asyncio.to_thread(get_groq_summary, clean_text)
-            await query.edit_message_text(f"📋 **AI Video Summary:**\n\n{summary}", parse_mode="Markdown")
-            
-        except ValueError as ve:
-            await query.edit_message_text(f"⚠️ {ve}")
-        except Exception as e:
-            await query.edit_message_text(f"⚠️ Summarization failed: {str(e)[:100]}")
-        return
-
     if data.startswith("cancel"):
         return await query.edit_message_text("Canceled.")
 
@@ -1852,6 +1744,8 @@ def main() -> None:
         .concurrent_updates(True)
         .build()
     )
+    
+    application.add_error_handler(error_handler)
     
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("search", search_command))
