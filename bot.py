@@ -1631,53 +1631,92 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
             
         await query.edit_message_text("📋 Fetching video transcript for AI summarization...")
-        job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
-        os.makedirs(job_dir, exist_ok=True)
         try:
-            def fetch_subs():
+            def fetch_info():
                 opts = {
                     "skip_download": True,
-                    "writesubtitles": True,
-                    "writeautomaticsub": True,
-                    "subtitleslangs": ["en", "en-US", "en-GB", "my", "my-MM"],
-                    "subtitlesformat": "vtt",
-                    "outtmpl": os.path.join(job_dir, "video"),
                     "quiet": True,
                     "extractor_args": {"youtube": {"player_client": ["tv_embedded", "android_vr", "ios", "web"]}}
                 }
                 if os.path.exists(COOKIES_FILE_PATH) and os.path.getsize(COOKIES_FILE_PATH) > 0:
                     opts["cookiefile"] = COOKIES_FILE_PATH
-                
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.extract_info(url, download=True)
-                
-            try:
-                await asyncio.to_thread(fetch_subs)
-            except Exception as yt_err:
-                await query.edit_message_text(f"⚠️ Failed to extract captions. Video might be restricted.\n`{str(yt_err)[:50]}`", parse_mode="Markdown")
-                return
-
-            vtt_file = next((os.path.join(job_dir, f) for f in os.listdir(job_dir) if f.endswith('.vtt')), None)
+                    return ydl.extract_info(url, download=False)
+                    
+            info = await asyncio.to_thread(fetch_info)
             
-            if not vtt_file:
+            subs = info.get('subtitles', {})
+            auto_subs = info.get('automatic_captions', {})
+            target_langs = ['en', 'en-US', 'en-GB', 'en-orig', 'en-IN', 'my', 'my-MM']
+            sub_url = None
+            is_json3 = False
+            
+            for lang_dict in [subs, auto_subs]:
+                if sub_url:
+                    break
+                for lang in target_langs:
+                    if lang in lang_dict:
+                        formats = lang_dict[lang]
+                        for f in formats:
+                            if f.get('ext') == 'json3':
+                                sub_url = f.get('url')
+                                is_json3 = True
+                                break
+                        if not sub_url and formats:
+                            sub_url = formats[0].get('url')
+                        if sub_url:
+                            break
+            
+            if not sub_url:
+                for lang_dict in [subs, auto_subs]:
+                    if sub_url:
+                        break
+                    for key, formats in lang_dict.items():
+                        if 'en' in key.lower() or 'my' in key.lower():
+                            for f in formats:
+                                if f.get('ext') == 'json3':
+                                    sub_url = f.get('url')
+                                    is_json3 = True
+                                    break
+                            if not sub_url and formats:
+                                sub_url = formats[0].get('url')
+                            if sub_url:
+                                break
+                                
+            if not sub_url:
                 await query.edit_message_text("⚠️ No suitable captions were found for this video. The AI cannot summarize it.")
                 return
                 
-            with open(vtt_file, "r", encoding="utf-8") as f:
-                raw_vtt = f.read()
-                
-            clean_text = re.sub(r'</c>|<c[^>]*>|<\d{2}:\d{2}:\d{2}\.\d{3}><c>|<\d{2}:\d{2}:\d{2}\.\d{3}>|^\d{2}:\d{2}:\d{2}\.\d{3} -->.*$', '', raw_vtt, flags=re.MULTILINE)
-            clean_text = re.sub(r'\n+', ' ', clean_text).strip()
+            resp = await asyncio.to_thread(requests.get, sub_url, timeout=10)
             
+            if is_json3 or 'json3' in sub_url:
+                data_json = resp.json()
+                events = data_json.get('events', [])
+                text_parts = []
+                for ev in events:
+                    if 'segs' in ev:
+                        for seg in ev['segs']:
+                            if 'utf8' in seg:
+                                text_parts.append(seg['utf8'])
+                clean_text = "".join(text_parts).replace('\n', ' ').strip()
+            else:
+                raw_text = resp.text
+                clean_text = re.sub(r'<[^>]+>', ' ', raw_text)
+                clean_text = re.sub(r'&\w+;', ' ', clean_text)
+                clean_text = re.sub(r'\n+', ' ', clean_text).strip()
+                
+            if not clean_text or len(clean_text) < 10:
+                await query.edit_message_text("⚠️ Caption track is empty or unreadable.")
+                return
+                
             await query.edit_message_text("📋 AI is analyzing the transcript...")
             summary = await asyncio.to_thread(get_groq_summary, clean_text)
             await query.edit_message_text(f"📋 **AI Video Summary:**\n\n{summary}", parse_mode="Markdown")
+            
         except ValueError as ve:
             await query.edit_message_text(f"⚠️ {ve}")
         except Exception as e:
             await query.edit_message_text(f"⚠️ Summarization failed: {str(e)[:100]}")
-        finally:
-            shutil.rmtree(job_dir, ignore_errors=True)
         return
 
     if data.startswith("cancel"):
