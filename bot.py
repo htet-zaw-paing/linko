@@ -632,7 +632,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     user_first_name = update.effective_user.first_name or "there"
     welcome_text = (
-        f"Hi {user_first_name}! Welcome to Linko.\n\n"
+        f"Hello {user_first_name}! Welcome to Linko. ⚡\n\n"
         "I am your fast and simple media assistant. Here is what I can do:\n\n"
         "Media & Downloads\n"
         "• Send any YouTube, TikTok, or Instagram link to download.\n"
@@ -644,7 +644,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "• Reply to an audio file with /edit Artist - Title to change its tags.\n\n"
         "Smart Features\n"
         "• Use /clip [link] 01:00-01:30 to cut a specific part of a video.\n"
-        "• Use /podcast [text] to turn written text into realistic audio.\n\n"
+        "• Use /podcast [text] to turn written text into realistic audio.\n"
         "Type /help to see more details."
     )
     await update.message.reply_text(
@@ -654,30 +654,31 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
-        "Linko Quick Help Guide\n\n"
-        "Basic Commands\n"
+        "<b>Linko Quick Help Guide</b> 📖\n\n"
+        "<b>Basic Commands</b>\n"
         "• Send a link: Downloads the video or audio.\n"
-        "• /search [song]: Finds music to download.\n"
-        "• /trending: Shows global top 10 songs.\n\n"
-        "Advanced Tools\n"
-        "• /clip [link] [start]-[end]: Trims a specific part of the media.\n"
-        "• /podcast [text]: Converts text to speech.\n"
-        "• /edit Artist - Title: Reply to an audio file to change its tags.\n\n"
-        "File Interactions\n"
+        "• <code>/search [song]</code>: Finds music to download.\n"
+        "• <code>/trending</code>: Shows global top 10 songs.\n\n"
+        "<b>Advanced Tools</b>\n"
+        "• <code>/clip [link] [start]-[end]</code>: Trims a specific part of the media.\n"
+        "• <code>/podcast [text]</code>: Converts text to speech.\n"
+        "• <code>/edit Artist - Title</code>: Reply to an audio file to change its tags.\n\n"
+        "<b>File Interactions</b>\n"
         "• Forward a voice note to identify the song or get a text transcript.\n"
-        "• Send a short video file to extract the audio or transcribe it.\n\n"
-        "Quality Options\n"
+        "• Send a short video file to extract the MP3 audio.\n\n"
+        "<b>Quality Options</b>\n"
         "Audio: Standard (128k) | Medium (192k) | High (320k)\n"
         "Video: MP4 | Voice Memo: OGG\n\n"
-        "Limits\n"
+        "<b>Limits</b>\n"
         "• Media must be under 30 minutes.\n"
         "• Files must be under 50 MB.\n\n"
-        "Full Guides\n"
-        "• English User Guide: https://telegra.ph/Linko---User-Guide-10-17\n"
-        "• Myanmar User Guide: https://telegra.ph/Linko---User-Guide-MM-10-17"
+        "<b>Full Guides</b>\n"
+        "• <a href='https://telegra.ph/Linko---User-Guide-10-17'>English User Guide</a>\n"
+        "• <a href='https://telegra.ph/Linko---User-Guide-MM-10-17'>မြန်မာလမ်းညွှန် ဖတ်ရန်</a>"
     )
     await update.message.reply_text(
         help_text, 
+        parse_mode="HTML", 
         disable_web_page_preview=True
     )
 
@@ -700,30 +701,30 @@ async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     about_text = (
-        "About Linko\n\n"
+        "<b>About Linko</b>\n\n"
         "Linko is a streamlined Telegram utility designed to simplify media downloading and music discovery.\n\n"
         "The bot allows users to save watermark-free videos, convert public web links into audio files, and identify playing music. It processes all requests directly within the chat and includes built-in features such as music search, trending charts, and lyrics retrieval.\n\n"
         "To ensure reliable performance, the system is powered by Python, yt-dlp, FFmpeg, and ShazamIO.\n\n"
-        "Developed and maintained by Htet Zaw Paing.\n"
-        "A project by MyanCode."
+        "Developed and maintained by <a href='https://www.htetzawpaing.site'>Htet Zaw Paing</a>.\n"
+        "A project by <a href='https://www.myancode.com'>MyanCode</a>."
     )
-    await update.message.reply_text(about_text)
+    await update.message.reply_text(about_text, parse_mode="HTML")
 
 async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     terms_text = (
-        "Linko Bot Terms of Service & Rules\n\n"
+        "<b>⚖️ Linko Bot Terms of Service & Rules</b>\n\n"
         "By using this bot, you explicitly agree to the following strict guidelines:\n\n"
-        "1. Copyright & Fair Use\n"
+        "<b>1. Copyright & Fair Use</b>\n"
         "You must only download content for which you hold the rights, or that is freely available under public domain/Creative Commons. You are solely responsible for how you use the downloaded media.\n\n"
-        "2. Prohibited Content\n"
+        "<b>2. Prohibited Content</b>\n"
         "Attempting to bypass DRM, download age-restricted, adult, or illegal content, or accessing private accounts without authorization is strictly prohibited.\n\n"
-        "3. Abuse & Rate Limits\n"
+        "<b>3. Abuse & Rate Limits</b>\n"
         "Spamming requests or exploiting the bot's queuing system will result in an automatic, permanent ban. The bot enforces strict rate limits to ensure fair access for all users.\n\n"
-        "4. Privacy Guarantee\n"
+        "<b>4. Privacy Guarantee</b>\n"
         "Linko operates on a strict zero-retention policy. All processed audio and video files are permanently purged from our servers the exact millisecond they are delivered to your Telegram chat.\n\n"
-        "Failure to adhere to these rules will result in immediate restriction from the bot."
+        "<i>Failure to adhere to these rules will result in immediate restriction from the bot.</i>"
     )
-    await update.message.reply_text(terms_text)
+    await update.message.reply_text(terms_text, parse_mode="HTML")
 
 async def send_donation_info(chat_id, context: ContextTypes.DEFAULT_TYPE) -> None:
     donate_caption = (
@@ -1666,7 +1667,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
         return
-
+        
     if data.startswith("transcribe|"):
         req_id = data.split("|")[1]
         session = GLOBAL_SESSION.pop(req_id, None)
@@ -1734,7 +1735,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 raise InterruptedError()
             
             def extract_ogg():
-                subprocess.run(['ffmpeg', '-y', '-threads', '0', '-i', temp_path, '-vn', '-ac', '1', '-c:a', 'libopus', '-b:a', '24k', audio_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(['ffmpeg', '-y', '-i', temp_path, '-vn', '-c:a', 'libopus', '-b:a', '32k', audio_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 
             await asyncio.to_thread(extract_ogg)
             
@@ -1809,6 +1810,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 user_active_tasks[user_id] -= 1
             shutil.rmtree(job_dir, ignore_errors=True)
         return
+        
 
     if data.startswith("cancel"):
         return await query.edit_message_text("Canceled.")
