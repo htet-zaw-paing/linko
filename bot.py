@@ -1207,8 +1207,8 @@ async def execute_video_download(chat_id, url, context, status_msg=None, start_s
     video_buttons = [
         [InlineKeyboardButton("Bookmark", callback_data="bmark")],
         [
-            InlineKeyboardButton("Buy Me a Coffee", callback_data="donate"),
-            InlineKeyboardButton("Feedback", url=FEEDBACK_URL)
+            InlineKeyboardButton("☕ Buy Me a Coffee", callback_data="donate"),
+            InlineKeyboardButton("💬 Feedback", url=FEEDBACK_URL)
         ]
     ]
     cache_key = f"vid|{url}|{start_sec}|{end_sec}"
