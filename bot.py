@@ -358,7 +358,11 @@ def run_ytdlp_with_fallback(ydl_opts: dict, url: str, start_sec: int = None, end
                     entries = list(info.get("entries") or [])
                     if not entries:
                         raise ValueError("No results found.")
-                    info = entries[0]
+                    
+                    valid_entry = next((e for e in entries if (e.get("duration") or 0) <= MAX_DURATION_SECONDS and not e.get("is_live")), None)
+                    if not valid_entry:
+                        raise ValueError(f"The media is longer than the {MAX_DURATION_SECONDS // 60}-minute limit.")
+                    info = valid_entry
                     
                 if info.get("is_live"):
                     raise ValueError("Live streams cannot be downloaded.")
@@ -665,7 +669,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "🎙️ *Podcast TTS:* `/podcast [text]` to turn text into realistic speech.\n"
         "🔍 *Search Music:* `/search [song name]` or use `@Linko4UBot` in any chat.\n"
         "🔥 *Trending:* `/trending` to see global top hits.\n"
-        "🎧 *Identify Song:* Forward a voice note or audio file to Shazam it.\n"
+        "🎧 *Identify & Transcribe:* Forward a voice note or audio file to Shazam or Transcribe it.\n"
         "🎬 *Extract Audio:* Send a short video to convert it to an audio file.\n"
         "🏷️ *Edit Tags:* Reply to any audio with `/edit Artist - Title` (attach a photo for cover art).\n"
         "📋 *AI Summary:* Send a YouTube link and click 'Summarize Video'.\n\n"
@@ -685,7 +689,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• <code>/clip [link] [start]-[end]</code> to trim media\n"
         "• <code>/podcast [text]</code> to generate realistic audio from text\n"
         "• <code>@Linko4UBot [query]</code> in any chat for inline search\n"
-        "• Send a voice note/audio to identify the song\n"
+        "• Send a voice note/audio to identify or transcribe\n"
         "• Send a video file to extract audio\n"
         "• Reply to an audio file with <code>/edit Artist - Title</code> to edit tags\n"
         "• <code>/search [song]</code> or <code>/trending</code>\n\n"
@@ -1091,10 +1095,13 @@ async def handle_audio_recognition(update: Update, context: ContextTypes.DEFAULT
     GLOBAL_SESSION[req_id] = {"file_id": file_obj.file_id}
     
     keyboard = [
-        [InlineKeyboardButton("🎵 Identify Song (Shazam)", callback_data=f"shazam|{req_id}")],
-        [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
+        [
+            InlineKeyboardButton("🎵 Shazam", callback_data=f"shazam|{req_id}"),
+            InlineKeyboardButton("📝 Transcribe", callback_data=f"transcribe|{req_id}")
+        ],
+        [InlineKeyboardButton("Cancel Processing", callback_data="cancel|000")]
     ]
-    await update.message.reply_text("🎧 Audio received! What would you like to do?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🎧 Audio received! Choose an advanced action:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_video_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     file_obj = update.message.video or update.message.document
@@ -1110,7 +1117,7 @@ async def handle_video_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     keyboard = [
         [InlineKeyboardButton("🎵 Extract Audio", callback_data=f"extract|{req_id}")],
-        [InlineKeyboardButton("Cancel", callback_data="cancel|000")]
+        [InlineKeyboardButton("Cancel Processing", callback_data="cancel|000")]
     ]
     await update.message.reply_text("🎬 Video received! What would you like to do?", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -1683,6 +1690,50 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             await query.edit_message_text("Sorry, the song recognition failed.")
         finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        return
+
+    if data.startswith("transcribe|"):
+        req_id = data.split("|")[1]
+        session = GLOBAL_SESSION.pop(req_id, None)
+        if not session:
+            await query.edit_message_text("Session expired. Please send the voice note again.")
+            return
+            
+        user_active_tasks[user_id] = user_active_tasks.get(user_id, 0) + 1
+        try:
+            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel Processing", callback_data=f"abort|{req_id}")]])
+            await query.edit_message_text("📝 AI is transcribing the audio...", reply_markup=cancel_kb)
+            job_dir = os.path.join(DOWNLOAD_DIR, str(uuid.uuid4())[:8])
+            os.makedirs(job_dir, exist_ok=True)
+            
+            tg_file = await context.bot.get_file(session["file_id"], read_timeout=120, write_timeout=120, connect_timeout=60)
+            temp_path = os.path.join(job_dir, "input_audio.oga")
+            await tg_file.download_to_drive(temp_path)
+            
+            if req_id in GLOBAL_CANCEL_FLAGS:
+                raise InterruptedError()
+            
+            transcription = await asyncio.wait_for(asyncio.to_thread(get_groq_transcription, temp_path), timeout=PROCESS_TIMEOUT)
+            
+            if req_id in GLOBAL_CANCEL_FLAGS:
+                raise InterruptedError()
+                
+            if len(transcription) > 4000:
+                transcription = transcription[:4000] + "...\n(Truncated)"
+            await query.edit_message_text(f"📝 **Transcription:**\n\n{transcription}", parse_mode="Markdown")
+        except InterruptedError:
+            await query.edit_message_text("Process canceled by user.")
+        except (asyncio.TimeoutError, TimeoutError):
+            await query.edit_message_text("⏳ Process timed out. The audio might be too long.")
+        except ValueError as ve:
+            await query.edit_message_text(f"⚠️ Error: {ve}")
+        except Exception as e:
+            await query.edit_message_text(f"⚠️ Transcription failed. Please ensure the audio is clear and try again.\n(Details: {str(e)[:50]})")
+        finally:
+            GLOBAL_CANCEL_FLAGS.discard(req_id)
+            if user_active_tasks[user_id] > 0:
+                user_active_tasks[user_id] -= 1
             shutil.rmtree(job_dir, ignore_errors=True)
         return
 
